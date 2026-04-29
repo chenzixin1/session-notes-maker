@@ -1,5 +1,7 @@
 # Session Notes Maker 使用文档
 
+![Session Notes Maker 项目概览：输入视频和 PPT 区域，自动完成转录、截图识别、稿件对齐、轻量打磨，并通过 config.py 配置 OpenRouter、火山 ASR 和 Cloudflare R2](assets/session-notes-maker-overview.png)
+
 这个 Skill 用来把一段演讲、课程、会议或带 PPT 的视频，自动生成一份可分享的 HTML 图文稿。最终产物包含：
 
 - 视频转录稿
