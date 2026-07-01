@@ -191,7 +191,7 @@ def main() -> None:
     parser.add_argument(
         "--image-format",
         choices=["jpg", "jpeg", "png", "webp"],
-        default="jpg",
+        default="png",
         help="Slide image format passed to 02_extract_slide_timestamps.py.",
     )
     parser.add_argument(

@@ -717,7 +717,7 @@ def extract_detection_frames_ffmpeg(
     layout_info,
     max_duration_sec: float = None,
     detect_width: int = 480,
-    image_format: str = "jpg",
+    image_format: str = "png",
 ):
     """Fast low-res detection extraction through ffmpeg rawvideo pipe.
 
@@ -825,7 +825,7 @@ def extract_detection_frames(
     layout_refresh_interval: float = 10.0,
     max_duration_sec: float = None,
     detect_width: int = 480,
-    image_format: str = "jpg",
+    image_format: str = "png",
 ):
     """Extract low-res in-memory frames for slide-change detection only.
 
@@ -950,7 +950,7 @@ def extract_keyframe_detection_frames_ffmpeg(
     layout_info,
     max_duration_sec: float = None,
     detect_width: int = 240,
-    image_format: str = "jpg",
+    image_format: str = "png",
 ):
     """Read low-res keyframes and their timestamps in one ffmpeg pass."""
     if shutil.which("ffmpeg") is None:
@@ -1150,7 +1150,7 @@ def hybrid_keyframe_slide_changes(
     layout_info,
     max_duration_sec: float = None,
     detect_width: int = 240,
-    image_format: str = "jpg",
+    image_format: str = "png",
     refine_workers: int = 6,
 ):
     """Fast default: keyframe recall plus local accurate refinement."""
@@ -1238,7 +1238,7 @@ def materialize_slide_frames(
     slide_changes,
     layout_info=None,
     dynamic_layout: bool = True,
-    image_format: str = "jpg",
+    image_format: str = "png",
     jpeg_quality: int = 85,
     workers: int = 6,
 ):
@@ -1445,8 +1445,8 @@ def main():
     parser.add_argument(
         "--image-format",
         choices=["jpg", "jpeg", "png", "webp"],
-        default="jpg",
-        help="Image format for materialized slide frames (default: jpg).",
+        default="png",
+        help="Image format for materialized slide frames (default: png).",
     )
     parser.add_argument(
         "--jpeg-quality",

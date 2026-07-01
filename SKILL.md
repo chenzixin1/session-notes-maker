@@ -146,8 +146,9 @@ python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/
    - 重复运行时，优先复用已保存的 `<video>.ppt_rect.json` 或显式传入 `--ppt-rect`。
    - 默认使用 `hybrid-keyframe`：先用 H.264 keyframes 快速召回候选，再只在候选附近做局部 2 秒网格 SSIM 精修。
    - 当 PPT 区域固定（显式 `--ppt-rect` 或 sidecar 已加载）时，默认会走 hybrid-keyframe；否则回退到准确扫描。
-   - 默认检测宽度为 `--detect-width 240`，默认输出 `--image-format jpg --jpeg-quality 85`。
-   - 完整 39:10 样本中，accurate 路径用时 `34.79s`，默认 hybrid-keyframe 用时 `8.56s`，同样输出 `28` 个 slide 起点；如遇到 keyframe 召回不稳定的视频，可显式传入 `--detection-backend accurate`。
+   - 默认检测宽度为 `--detect-width 240`，默认输出 `--image-format png`，优先保证 PPT 文字、线条和图表清晰度。
+   - 完整 39:10 样本中，accurate 路径用时 `34.79s`，默认 hybrid-keyframe + PNG 用时 `9.34s`，同样输出 `28` 个 slide 起点，速度约为 `3.72x`；如遇到 keyframe 召回不稳定的视频，可显式传入 `--detection-backend accurate`。
+   - 如果用户更看重速度或体积，可显式传入 `--image-format jpg --jpeg-quality 90`。
 
 3. **整合转录稿**
    - 运行 `03_integrate_transcript_slides.py`。
@@ -209,7 +210,7 @@ python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/
 ## 变更日志
 
 - `2026-07-01`: 默认抽帧路径切换为 `hybrid-keyframe`，结合 keyframe 快速召回和局部 accurate 精修。
-- `2026-07-01`: 默认截图格式切换为 JPG，以降低导出耗时和 HTML 体积；保留 `--image-format png` 供需要 PNG 的场景使用。
+- `2026-07-01`: 默认截图格式保持 PNG，以保证 PPT 文字和线条质量；保留 `--image-format jpg|webp` 供小体积/极速场景使用。
 - `2026-07-01`: 保留 `--detection-backend accurate` 作为保守回退路径。
 
 ## 实践经验

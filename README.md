@@ -410,15 +410,16 @@ python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py \
 
 1. 先只解 H.264 keyframes，用低清灰度图快速召回 slide 变化候选；
 2. 对连续候选附近做局部 2 秒网格 SSIM 精修，过滤动画/转场尾巴；
-3. 只为精修后的 slide 起点并行导出高清 JPG。
+3. 只为精修后的 slide 起点并行导出高清图片。
 
-当 PPT 区域固定时，hybrid-keyframe 是默认路径。默认检测宽度是 `--detect-width 240`，默认图片格式是 `--image-format jpg --jpeg-quality 85`。
+当 PPT 区域固定时，hybrid-keyframe 是默认路径。默认检测宽度是 `--detect-width 240`，默认图片格式是 `--image-format png`，优先保证 PPT 文字、线条和图表清晰度。
 
-如果某个视频编码不适合 keyframe 召回，可使用 `--detection-backend accurate` 回到完整 2 秒网格扫描。完整 39:10 样本基准中，accurate 路径用时 `34.79s`，hybrid-keyframe 默认路径用时 `8.56s`，输出同样为 `28` 个 slide 起点，速度约为 `4.06x`。
+如果某个视频编码不适合 keyframe 召回，可使用 `--detection-backend accurate` 回到完整 2 秒网格扫描。完整 39:10 样本基准中，accurate 路径用时 `34.79s`，hybrid-keyframe + PNG 默认路径用时 `9.34s`，输出同样为 `28` 个 slide 起点，速度约为 `3.72x`。如果需要更小体积或极限速度，可显式使用 `--image-format jpg --jpeg-quality 90`。
 
 ### 7.5 变更日志
 
-- `2026-07-01`: 默认抽帧路径改为 `hybrid-keyframe`，结合 keyframe 快速召回和局部 accurate 精修；默认输出 JPG，显著减少截图导出时间和 HTML 体积。
+- `2026-07-01`: 默认抽帧路径改为 `hybrid-keyframe`，结合 keyframe 快速召回和局部 accurate 精修。
+- `2026-07-01`: 默认截图格式保持 PNG，优先保证 PPT 文字和线条质量；JPG/WebP 作为可选小体积/极速模式。
 - `2026-07-01`: 保留 `--detection-backend accurate`，用于需要完整 2 秒网格扫描的保守场景。
 - `2026-07-01`: HTML helper 的图片引用清理从只支持 PNG 扩展为支持 PNG/JPG/JPEG/WebP。
 
