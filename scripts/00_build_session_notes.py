@@ -16,6 +16,7 @@ from urllib.parse import unquote
 
 SCRIPT_PATH = Path(__file__).resolve()
 SCRIPT_DIR = SCRIPT_PATH.parent
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
 def run(cmd: list[str], cwd: Path = SCRIPT_DIR) -> None:
@@ -92,13 +93,13 @@ def rewrite_md_links(markdown_path: Path, image_dir_name: str) -> None:
     lines = text.splitlines(keepends=True)
     new_lines: list[str] = []
     for line in lines:
-        if line.lstrip().startswith("![") and "](" in line and ".png" in line:
+        if line.lstrip().startswith("![") and "](" in line and any(ext in line.lower() for ext in IMAGE_EXTENSIONS):
             line = re.sub(r"!\[([^\]]*)\]\((<[^>]+>|[^)]+)\)", replace_target, line)
         new_lines.append(line)
     markdown_path.write_text("".join(new_lines), encoding="utf-8")
 
 
-def referenced_png_names(markdown_path: Path, image_dir_name: str) -> set[str]:
+def referenced_image_names(markdown_path: Path, image_dir_name: str) -> set[str]:
     text = markdown_path.read_text(encoding="utf-8")
     pattern = re.compile(r"!\[[^\]]*\]\((<[^>]+>|[^)]+)\)")
     refs: set[str] = set()
@@ -110,14 +111,16 @@ def referenced_png_names(markdown_path: Path, image_dir_name: str) -> set[str]:
     return refs
 
 
-def remove_unreferenced_pngs(image_dir: Path, keep_names: set[str]) -> tuple[int, int]:
+def remove_unreferenced_images(image_dir: Path, keep_names: set[str]) -> tuple[int, int]:
     kept = 0
     deleted = 0
-    for png in image_dir.glob("*.png"):
-        if png.name in keep_names:
+    for image in image_dir.iterdir():
+        if not image.is_file() or image.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        if image.name in keep_names:
             kept += 1
         else:
-            png.unlink()
+            image.unlink()
             deleted += 1
     return kept, deleted
 
@@ -179,6 +182,24 @@ def main() -> None:
         default=240,
         help="Low-res detection width passed to 02_extract_slide_timestamps.py.",
     )
+    parser.add_argument(
+        "--detection-backend",
+        choices=["hybrid-keyframe", "accurate"],
+        default="hybrid-keyframe",
+        help="Slide detection backend passed to 02_extract_slide_timestamps.py.",
+    )
+    parser.add_argument(
+        "--image-format",
+        choices=["jpg", "jpeg", "png", "webp"],
+        default="jpg",
+        help="Slide image format passed to 02_extract_slide_timestamps.py.",
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=85,
+        help="JPEG/WebP quality passed to 02_extract_slide_timestamps.py.",
+    )
     parser.add_argument("--threads", type=int, default=4, help="Threads for 04_polish_slide_transcript segments.")
     parser.add_argument(
         "--polish-provider",
@@ -234,6 +255,12 @@ def main() -> None:
         slides_md.name,
         "--detect-width",
         str(args.detect_width),
+        "--detection-backend",
+        args.detection_backend,
+        "--image-format",
+        args.image_format,
+        "--jpeg-quality",
+        str(args.jpeg_quality),
     ]
     if args.interactive:
         cmd02.append("--interactive")
@@ -279,9 +306,9 @@ def main() -> None:
     shutil.copytree(work_dir / "ppt_pics", final_image_dir)
     rewrite_md_links(final_md, image_dir_name)
 
-    keep = referenced_png_names(final_md, image_dir_name)
-    kept, deleted = remove_unreferenced_pngs(final_image_dir, keep)
-    print(f"Referenced PNGs kept: {kept}; unreferenced PNGs deleted: {deleted}")
+    keep = referenced_image_names(final_md, image_dir_name)
+    kept, deleted = remove_unreferenced_images(final_image_dir, keep)
+    print(f"Referenced images kept: {kept}; unreferenced images deleted: {deleted}")
 
     html_path = share_dir / f"{stem}.html"
     run(["pandoc", str(final_md), "-o", str(html_path), "--standalone", "--metadata", f"title={stem}"])

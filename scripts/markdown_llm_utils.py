@@ -227,23 +227,24 @@ def find_matching_image(slide_number: int, base_dir: str) -> str:
         logging.warning(f"ppt_pics directory not found at {ppt_pics_dir}")
         return ""
     
-    # List all PNG files in the directory
+    # List slide image files in the directory
     try:
-        png_files = [f for f in os.listdir(ppt_pics_dir) if f.endswith('.png')]
+        image_exts = ('.png', '.jpg', '.jpeg', '.webp')
+        image_files = [f for f in os.listdir(ppt_pics_dir) if f.lower().endswith(image_exts)]
         
         # Sort the files to ensure we get them in order
-        png_files.sort()
+        image_files.sort()
         
         # If slide number is valid and within range of available files
-        if slide_number > 0 and slide_number <= len(png_files):
+        if slide_number > 0 and slide_number <= len(image_files):
             # Return the path to the corresponding file (1-indexed to 0-indexed)
-            return os.path.join(ppt_pics_dir, png_files[slide_number - 1])
-        elif png_files:
+            return os.path.join(ppt_pics_dir, image_files[slide_number - 1])
+        elif image_files:
             # Log warning and return first image as fallback
             logging.warning(f"Slide {slide_number} out of range. Using first available image.")
-            return os.path.join(ppt_pics_dir, png_files[0])
+            return os.path.join(ppt_pics_dir, image_files[0])
         else:
-            logging.warning(f"No PNG files found in {ppt_pics_dir}")
+            logging.warning(f"No slide images found in {ppt_pics_dir}")
             return ""
     except Exception as e:
         logging.error(f"Error finding matching image: {e}")
