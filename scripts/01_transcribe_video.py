@@ -31,6 +31,15 @@ import boto3
 from botocore.client import Config
 from urllib.parse import urlparse, quote
 
+
+def _redact_headers(headers):
+    redacted = dict(headers)
+    for key in list(redacted.keys()):
+        if key.lower() in {"x-api-key", "authorization"}:
+            redacted[key] = "[REDACTED]"
+    return redacted
+
+
 # Import configuration
 try:
     import config
@@ -217,7 +226,7 @@ class AudioTranscriber:
         }
         
         print(f"DEBUG: submit_transcription_task: Request URL: {self.submit_url}")
-        print(f"DEBUG: submit_transcription_task: Request Headers: {json.dumps(headers, indent=2)}")
+        print(f"DEBUG: submit_transcription_task: Request Headers: {json.dumps(_redact_headers(headers), indent=2)}")
         print(f"DEBUG: submit_transcription_task: Request Payload: {json.dumps(payload, indent=2)}")
 
         try:
@@ -283,7 +292,7 @@ class AudioTranscriber:
         payload = {}
         
         print(f"DEBUG: query_transcription_result: Request URL: {self.query_url}")
-        print(f"DEBUG: query_transcription_result: Request Headers: {json.dumps(headers, indent=2)}")
+        print(f"DEBUG: query_transcription_result: Request Headers: {json.dumps(_redact_headers(headers), indent=2)}")
         print(f"DEBUG: query_transcription_result: Request Payload: {json.dumps(payload, indent=2)}")
 
         try:

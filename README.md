@@ -404,7 +404,18 @@ python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py \
   --zip
 ```
 
-### 7.4 压缩 PNG 后打包
+### 7.4 抽帧速度模式
+
+`02_extract_slide_timestamps.py` 默认使用两阶段抽帧：
+
+1. 先用低清灰度图检测 slide 变化；
+2. 只为检测出的 slide 起点导出高清 PNG。
+
+当 PPT 区域固定时，脚本会优先使用 ffmpeg rawvideo 管道完成低清采样、裁剪、缩放和灰度转换。默认检测宽度是 `--detect-width 240`。
+
+10 分钟样本基准测试中，原全量高清 PNG 抽帧路径用时 `49.28s`，当前两阶段路径用时 `10.35s`，速度约为原路径的 `4.76x`，且只写出最终命中的 slide PNG。
+
+### 7.5 压缩 PNG 后打包
 
 如果需要保持 PNG 格式但压缩体积：
 

@@ -70,7 +70,9 @@ cp ~/.cursor/skills/session-notes-maker/scripts/config.example.py ~/.cursor/skil
 
 ## 推荐命令
 
-使用 helper 脚本：
+### 路径 A：OpenRouter 自动处理
+
+使用 helper 脚本，保持原始自动化路径：
 
 ```bash
 python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/path/to/video.mp4" --interactive --zip
@@ -88,6 +90,50 @@ python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/
 python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/path/to/video.mp4" --ppt-rect "0.0359,0.0806,0.6792,0.7296" --zip
 ```
 
+### 路径 B：Codex 友好处理
+
+当 OpenRouter key 不可用，或当前执行者（如 Codex）可以直接读图时，保留前 3 步的本地处理和火山 ASR，只把第 4 步切到 Codex 友好路径。
+
+保底生成未打磨但已对齐的 HTML：
+
+```bash
+python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/path/to/video.mp4" \
+  --ppt-rect "0.0359,0.0806,0.6792,0.7296" \
+  --polish-provider passthrough \
+  --zip
+```
+
+如果 Codex 已经逐页读图并生成 notes，可使用：
+
+```bash
+python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/path/to/video.mp4" \
+  --ppt-rect "0.0359,0.0806,0.6792,0.7296" \
+  --polish-provider codex-notes \
+  --codex-notes-dir "/path/to/codex_notes" \
+  --embed-html-images \
+  --zip
+```
+
+`codex_notes` 中每页可以使用以下文件名之一：
+
+- `slide_01.md`
+- `slide_1.md`
+- `<frame_stem>.md`，例如 `frame_00_01_20_000.md`
+
+每个 note 推荐包含：
+
+```markdown
+## 幻灯片要点
+
+- 这一页的标题、术语、图表关系、容易被 ASR 写错的词。
+
+## 轻量打磨稿
+
+这里放 Codex 结合图片和该页口述稿整理后的正文。
+```
+
+如果没有 `## 轻量打磨稿`，脚本会把 `## 幻灯片要点` 和清理后的口述稿一起写入最终 Markdown。
+
 ## 工作流程
 
 1. **转录视频**
@@ -98,6 +144,9 @@ python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/
    - 运行 `02_extract_slide_timestamps.py`。
    - 如果没有可靠的 PPT 截图区域，使用 `--interactive` 让用户框选。
    - 重复运行时，优先复用已保存的 `<video>.ppt_rect.json` 或显式传入 `--ppt-rect`。
+   - 默认使用两阶段抽帧：先用低清灰度图检测 slide 变化，再只为命中的 slide 起点导出高清 PNG。
+   - 当 PPT 区域固定（显式 `--ppt-rect` 或 sidecar 已加载）时，两阶段会优先使用 ffmpeg rawvideo 管道完成低清采样、裁剪、缩放和灰度转换；否则回退到 OpenCV 顺序采样。
+   - 默认检测宽度为 `--detect-width 240`，在 10 分钟样本上比原全量抽帧路径快约 4.76 倍；如遇到非常细微的页面变化，可提高到 320 或 480。
 
 3. **整合转录稿**
    - 运行 `03_integrate_transcript_slides.py`。
@@ -105,9 +154,12 @@ python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/
    - 输出：`<video>_integrated.md`。
 
 4. **使用轻量打磨模式处理**
-   - 固定使用 `light-plus`，不提供重写模式。
-   - 运行 `04_polish_slide_transcript.py`，参数：
+   - 默认路径保持原来的 OpenRouter 自动处理。
+   - Codex 友好路径可用 `--polish-provider codex-notes` 或 `--polish-provider passthrough`，不依赖 OpenRouter key。
+   - 运行 `04_polish_slide_transcript.py`，常用参数：
      - `--mode light-plus`
+     - `--provider openrouter|codex-notes|passthrough`
+     - `--codex-notes-dir /path/to/codex_notes`
      - `--no-review`
      - `-y`
    - 输出：`<video>_integrated_Processed.md`。
@@ -120,6 +172,7 @@ python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/
    - 只保留最终 Markdown 实际引用的 PNG 图片。
    - 使用 `pandoc` 转换为 standalone HTML。
    - 将 HTML 正文宽度调整为适合 PC 阅读的宽度（`max-width: 1100px`），并让图片自适应正文宽度。
+   - 如果本地浏览器或分享环境对相对图片路径不稳定，加入 `--embed-html-images`，把最终 HTML 中引用的本地图片内嵌为 data URI，打开单个 HTML 也能稳定显示。
 
 6. **可选打包**
    - 如果用户希望更小的包且必须保持 PNG 格式，用 `05_compress_png_images.py` 原地压缩被引用的 PNG。
@@ -148,7 +201,7 @@ python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/
 报告完成前必须检查：
 
 - HTML 文件存在；
-- 所有 `<img src="...">` 引用都能在分享目录内找到；
+- 所有 `<img src="...">` 引用都能在分享目录内找到，或已被 `--embed-html-images` 内嵌为 `data:image/...`；
 - 如果用户要求 PNG 格式，确认图片文件仍然是 PNG；
 - 如果用户要求打包，报告最终 zip 路径和大小。
 

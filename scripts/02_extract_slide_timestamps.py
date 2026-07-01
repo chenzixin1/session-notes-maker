@@ -2,14 +2,15 @@
 从演讲视频中抽取关键帧并生成带时间戳的 Markdown 索引。
 
 该脚本属于流程的第 02 步：
-1. 按固定时间间隔截取视频画面，保存到 `ppt_pics/`
-2. 基于帧间相似度检测幻灯片切换节点
+1. 按固定时间间隔读取视频画面，用低清灰度图做幻灯片变化检测
+2. 仅把检测出的幻灯片起始帧保存为高清 PNG 到 `ppt_pics/`
 3. 生成 `ppt_timestamps.md`，记录每张幻灯片的时间戳与预览图
 
 Usage:
     python 02_extract_slide_timestamps.py input_video.mp4 [-o OUTPUT_DIR] [-i INTERVAL] [-t THRESHOLD]
         [--md_name MD_NAME] [-I | --interactive] [--rect_file PATH] [--force_reselect]
         [--ppt_rect x1,y1,x2,y2] [--max_duration SEC]
+        [--detect-width WIDTH]
 
 Example (auto):
     python 02_extract_slide_timestamps.py data/inputs/GDB/media/GDB.mp4 -o data/outputs/GDB/GDB_frames
@@ -24,10 +25,11 @@ import cv2
 import os
 import json
 import argparse
+import shutil
+import subprocess
 from skimage.metrics import structural_similarity as ssim
 import numpy as np
 import datetime
-import math
 import concurrent.futures  # Added for threading
 from typing import Dict, List, Optional, Tuple
 
@@ -660,7 +662,144 @@ def detect_mixed_layout(
     print("No mixed layout detected. Using full frame for extraction.")
     return layout
 
-def extract_frames(
+def _crop_to_ppt_region(frame: np.ndarray, layout_info=None) -> np.ndarray:
+    """Crop a video frame to the active PPT region when one is known."""
+    if layout_info and layout_info.get("ppt_rect"):
+        x, y, w, h = layout_info["ppt_rect"]
+        if w > 0 and h > 0:
+            x2 = min(x + w, frame.shape[1])
+            y2 = min(y + h, frame.shape[0])
+            x = max(0, min(x, frame.shape[1] - 1))
+            y = max(0, min(y, frame.shape[0] - 1))
+            if x < x2 and y < y2:
+                return frame[y:y2, x:x2].copy()
+            print("Warning: PPT crop rectangle invalid. Falling back to full frame.")
+        else:
+            print("Warning: PPT crop rectangle has non-positive dimensions. Falling back to full frame.")
+    return frame
+
+
+def _resize_for_detection(frame: np.ndarray, detect_width: int) -> np.ndarray:
+    """Convert a cropped frame to low-res grayscale for SSIM detection."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if detect_width <= 0 or gray.shape[1] <= detect_width:
+        return gray
+    detect_height = max(1, int(round(gray.shape[0] * (detect_width / gray.shape[1]))))
+    return cv2.resize(gray, (detect_width, detect_height), interpolation=cv2.INTER_AREA)
+
+
+def extract_detection_frames_ffmpeg(
+    video_path,
+    output_dir,
+    interval_sec,
+    layout_info,
+    max_duration_sec: float = None,
+    detect_width: int = 480,
+):
+    """Fast low-res detection extraction through ffmpeg rawvideo pipe.
+
+    This path is used only when the PPT crop is static. It lets ffmpeg sample,
+    crop, scale, and gray-convert frames in C, avoiding Python-level frame
+    skipping and OpenCV random/forward decode overhead.
+    """
+    if shutil.which("ffmpeg") is None:
+        return None
+    if not layout_info or not layout_info.get("ppt_rect"):
+        return None
+    if interval_sec <= 0 or detect_width <= 0:
+        return None
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration_sec = total_frames / fps if fps > 0 else 0
+    cap.release()
+
+    if max_duration_sec is not None and max_duration_sec > 0:
+        duration_sec = min(duration_sec, max_duration_sec)
+
+    x, y, w, h = layout_info["ppt_rect"]
+    if w <= 0 or h <= 0:
+        return None
+
+    detect_height = max(1, int(round(h * (detect_width / float(w)))))
+    sample_fps = 1.0 / float(interval_sec)
+    vf = f"fps=fps={sample_fps:.8f},crop={w}:{h}:{x}:{y},scale={detect_width}:{detect_height},format=gray"
+
+    os.makedirs(output_dir, exist_ok=True)
+    pics_dir = os.path.join(output_dir, "ppt_pics")
+    os.makedirs(pics_dir, exist_ok=True)
+
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        video_path,
+    ]
+    if duration_sec > 0:
+        cmd.extend(["-t", f"{duration_sec:.6f}"])
+    cmd.extend(["-an", "-sn", "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+
+    print(
+        f"Detecting slide changes with ffmpeg low-res pipe every {interval_sec} seconds "
+        f"(width={detect_width}, crop={layout_info['ppt_rect']})..."
+    )
+    print(f"Video Info: FPS={fps:.2f}, Total Frames={total_frames}, Duration={format_time(duration_sec)}")
+
+    frame_size = detect_width * detect_height
+    detection_frames = []
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout is not None
+    frame_index = 0
+    try:
+        while True:
+            buf = proc.stdout.read(frame_size)
+            if not buf:
+                break
+            if len(buf) != frame_size:
+                print(f"Warning: ffmpeg returned a partial detection frame ({len(buf)}/{frame_size} bytes).")
+                break
+            current_time_sec = frame_index * interval_sec
+            if duration_sec > 0 and current_time_sec > duration_sec + 1e-6:
+                break
+            timestamp_str_file = format_time(current_time_sec).replace(":", "_").replace(".", "_")
+            img_filename = f"frame_{timestamp_str_file}.png"
+            img_path = os.path.join(pics_dir, img_filename)
+            relative_path = os.path.join("ppt_pics", img_filename)
+            detect_gray = np.frombuffer(buf, dtype=np.uint8).reshape((detect_height, detect_width)).copy()
+            detection_frames.append(
+                {
+                    "time_sec": current_time_sec,
+                    "path": img_path,
+                    "filename": img_filename,
+                    "relative_path": relative_path,
+                    "detect_gray": detect_gray,
+                }
+            )
+            frame_index += 1
+            if frame_index % 100 == 0:
+                print(f"  Prepared detection frame at {format_time(current_time_sec)}")
+    finally:
+        proc.stdout.close()
+
+    stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr is not None else ""
+    return_code = proc.wait()
+    if return_code != 0:
+        print(f"Warning: ffmpeg detection pipe failed with code {return_code}. Falling back to OpenCV.")
+        if stderr.strip():
+            print(stderr.strip()[:2000])
+        return None
+
+    print(f"Finished preparing {len(detection_frames)} low-res detection frames via ffmpeg.")
+    return detection_frames
+
+
+def extract_detection_frames(
     video_path,
     output_dir,
     interval_sec,
@@ -668,23 +807,34 @@ def extract_frames(
     dynamic_layout: bool = True,
     layout_refresh_interval: float = 10.0,
     max_duration_sec: float = None,
+    detect_width: int = 480,
 ):
-    """Extracts frames from video at specified intervals.
+    """Extract low-res in-memory frames for slide-change detection only.
 
-    When layout_info indicates mixed content, frames are cropped to the PPT region before saving.
+    This is the fast first stage: it samples the configured timestamps, crops
+    to the PPT region, downsizes to grayscale, and keeps the comparison image
+    in memory instead of writing every sampled frame as PNG.
     """
-    print(f"Extracting frames from '{video_path}' every {interval_sec} seconds...")
+    if not dynamic_layout:
+        ffmpeg_frames = extract_detection_frames_ffmpeg(
+            video_path,
+            output_dir,
+            interval_sec,
+            layout_info,
+            max_duration_sec=max_duration_sec,
+            detect_width=detect_width,
+        )
+        if ffmpeg_frames is not None:
+            return ffmpeg_frames
 
-    # Create main output directory if it doesn't exist
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        print(f"Created directory: {output_dir}")
+    print(
+        f"Detecting slide changes from '{video_path}' every {interval_sec} seconds "
+        f"using low-res width={detect_width}..."
+    )
 
-    # Create ppt_pics subdirectory for images
+    os.makedirs(output_dir, exist_ok=True)
     pics_dir = os.path.join(output_dir, "ppt_pics")
-    if not os.path.exists(pics_dir):
-        os.makedirs(pics_dir)
-        print(f"Created images directory: {pics_dir}")
+    os.makedirs(pics_dir, exist_ok=True)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -694,99 +844,140 @@ def extract_frames(
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration_sec = total_frames / fps if fps > 0 else 0
-    
-    # Limit duration if max_duration_sec is specified
+
     if max_duration_sec is not None and max_duration_sec > 0:
         duration_sec = min(duration_sec, max_duration_sec)
-        print(f"Limiting extraction to first {max_duration_sec} seconds ({format_time(max_duration_sec)})")
+        print(f"Limiting detection to first {max_duration_sec} seconds ({format_time(max_duration_sec)})")
 
     print(f"Video Info: FPS={fps:.2f}, Total Frames={total_frames}, Duration={format_time(duration_sec)}")
 
-    extracted_frames = []
+    sample_times: List[float] = []
     current_time_sec = 0.0
+    while current_time_sec <= duration_sec:
+        sample_times.append(current_time_sec)
+        current_time_sec += interval_sec
+        if interval_sec <= 0:
+            print("Error: Interval must be positive.")
+            break
+        if len(sample_times) > (duration_sec / interval_sec) * 2 and duration_sec > 0:
+            print("Warning: Prepared significantly more frame timestamps than expected. Stopping.")
+            break
 
+    detection_frames = []
     current_layout = layout_info
     last_layout_update_time = -1e9
+    current_frame_id = 0
 
-    while current_time_sec <= duration_sec:
-        frame_id = int(current_time_sec * fps)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+    for current_time_sec in sample_times:
+        target_frame_id = int(current_time_sec * fps)
+
+        if target_frame_id < current_frame_id:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_id)
+            current_frame_id = target_frame_id
+
+        while current_frame_id < target_frame_id:
+            if not cap.grab():
+                break
+            current_frame_id += 1
+
         ret, frame = cap.read()
+        current_frame_id += 1
 
         if not ret:
-            # Might happen at the very end or if seeking fails
             print(f"Warning: Could not read frame at {format_time(current_time_sec)}")
-            current_time_sec += interval_sec
             continue
 
-        timestamp_str_file = format_time(current_time_sec).replace(":", "_").replace(".", "_")
-        img_filename = f"frame_{timestamp_str_file}.png"
-
-        # Save to ppt_pics subdirectory
-        pics_dir = os.path.join(output_dir, "ppt_pics")
-        img_path = os.path.join(pics_dir, img_filename)
-
-        # 根据需要动态更新 PPT 区域：场景切换时自动调整截图区域
         if dynamic_layout and (current_layout is None or current_time_sec - last_layout_update_time >= layout_refresh_interval):
             current_layout = _detect_ppt_rect_in_single_frame(frame)
             last_layout_update_time = current_time_sec
             print(f"[Dynamic layout] t={format_time(current_time_sec)} PPT rect={current_layout.get('ppt_rect')}")
 
-        frame_to_save = frame
         active_layout = current_layout if dynamic_layout else layout_info
+        cropped = _crop_to_ppt_region(frame, active_layout)
+        detect_gray = _resize_for_detection(cropped, detect_width)
 
-        if active_layout and active_layout.get("ppt_rect"):
-            x, y, w, h = active_layout["ppt_rect"]
-            if w > 0 and h > 0:
-                x2 = min(x + w, frame.shape[1])
-                y2 = min(y + h, frame.shape[0])
-                x = max(0, min(x, frame.shape[1] - 1))
-                y = max(0, min(y, frame.shape[0] - 1))
-                if x < x2 and y < y2:
-                    frame_to_save = frame[y:y2, x:x2].copy()
-                else:
-                    print("Warning: PPT crop rectangle invalid. Falling back to full frame.")
-            else:
-                print("Warning: PPT crop rectangle has non-positive dimensions. Falling back to full frame.")
-
-        cv2.imwrite(img_path, frame_to_save)
-
-        # Store the relative path for markdown (ppt_pics/filename.png)
+        timestamp_str_file = format_time(current_time_sec).replace(":", "_").replace(".", "_")
+        img_filename = f"frame_{timestamp_str_file}.png"
+        img_path = os.path.join(pics_dir, img_filename)
         relative_path = os.path.join("ppt_pics", img_filename)
-        extracted_frames.append({'time_sec': current_time_sec, 'path': img_path, 'filename': img_filename, 'relative_path': relative_path})
+        detection_frames.append(
+            {
+                "time_sec": current_time_sec,
+                "path": img_path,
+                "filename": img_filename,
+                "relative_path": relative_path,
+                "detect_gray": detect_gray,
+            }
+        )
 
-        # Print progress sparsely
-        if len(extracted_frames) % 20 == 0:
-             print(f"  Extracted frame at {format_time(current_time_sec)}")
-
-
-        current_time_sec += interval_sec
-        # Small safety break for potential infinite loops with faulty videos
-        if interval_sec <= 0:
-             print("Error: Interval must be positive.")
-             break
-        if len(extracted_frames) > (duration_sec / interval_sec) * 2 and duration_sec > 0: # Heuristic check
-            print("Warning: Extracted significantly more frames than expected. Stopping.")
-            break
-
+        if len(detection_frames) % 100 == 0:
+            print(f"  Prepared detection frame at {format_time(current_time_sec)}")
 
     cap.release()
-    print(f"Finished extracting {len(extracted_frames)} frames.")
-    return extracted_frames
+    print(f"Finished preparing {len(detection_frames)} low-res detection frames.")
+    return detection_frames
+
+
+def materialize_slide_frames(
+    video_path,
+    slide_changes,
+    layout_info=None,
+    dynamic_layout: bool = True,
+):
+    """Save high-resolution PNGs only for frames identified as slide starts."""
+    print(f"Materializing {len(slide_changes)} high-resolution slide frames...")
+    if not slide_changes:
+        return []
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error: Could not open video file {video_path}")
+        return []
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    saved = []
+    for index, slide in enumerate(slide_changes, start=1):
+        frame_id = int(slide["time_sec"] * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+        ret, frame = cap.read()
+        if not ret:
+            print(f"Warning: Could not read selected slide frame at {format_time(slide['time_sec'])}")
+            continue
+
+        active_layout = _detect_ppt_rect_in_single_frame(frame) if dynamic_layout else layout_info
+        frame_to_save = _crop_to_ppt_region(frame, active_layout)
+        os.makedirs(os.path.dirname(slide["path"]), exist_ok=True)
+        cv2.imwrite(slide["path"], frame_to_save)
+        slide.pop("detect_gray", None)
+        saved.append(slide)
+
+        if index % 20 == 0:
+            print(f"  Materialized {index}/{len(slide_changes)} slide frames...")
+
+    cap.release()
+    print(f"Finished materializing {len(saved)} slide frames.")
+    return saved
+
+
+def _gray_for_comparison(frame_info):
+    if "detect_gray" in frame_info:
+        return frame_info["detect_gray"]
+
+    img = cv2.imread(frame_info["path"])
+    if img is None:
+        return None
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
 
 def compare_frame_pair(prev_frame_info, current_frame_info, threshold, index):
     """Helper function to compare a single pair of frames for SSIM."""
     try:
-        # Use the full path to read the images
-        prev_img = cv2.imread(prev_frame_info['path'])
-        curr_img = cv2.imread(current_frame_info['path'])
+        prev_img_gray = _gray_for_comparison(prev_frame_info)
+        curr_img_gray = _gray_for_comparison(current_frame_info)
 
-        if prev_img is None or curr_img is None:
-            print(f"Warning: Could not read image for comparison: {prev_frame_info['path'] if prev_img is None else ''} {current_frame_info['path'] if curr_img is None else ''}")
+        if prev_img_gray is None or curr_img_gray is None:
+            print(f"Warning: Could not read image for comparison: {prev_frame_info['path'] if prev_img_gray is None else ''} {current_frame_info['path'] if curr_img_gray is None else ''}")
             return None # Cannot compare if images are missing
-
-        prev_img_gray = cv2.cvtColor(prev_img, cv2.COLOR_BGR2GRAY)
-        curr_img_gray = cv2.cvtColor(curr_img, cv2.COLOR_BGR2GRAY)
 
         if prev_img_gray.shape != curr_img_gray.shape:
             print(f"Warning: Frame dimensions mismatch between {prev_frame_info['path']} and {current_frame_info['path']}. Skipping comparison.")
@@ -795,7 +986,8 @@ def compare_frame_pair(prev_frame_info, current_frame_info, threshold, index):
             return None
 
         # Calculate SSIM
-        similarity_index = ssim(prev_img_gray, curr_img_gray, data_range=prev_img_gray.max() - prev_img_gray.min())
+        data_range = max(int(prev_img_gray.max()) - int(prev_img_gray.min()), 1)
+        similarity_index = ssim(prev_img_gray, curr_img_gray, data_range=data_range)
 
         # print(f"  Compared {prev_frame_info['filename']} and {current_frame_info['filename']} (Index {index}): SSIM = {similarity_index:.4f}")
 
@@ -901,6 +1093,12 @@ def main():
     parser.add_argument("-i", "--interval", type=float, default=2.0, help="Interval in seconds between frame captures (default: 2.0).")
     parser.add_argument("-t", "--threshold", type=float, default=0.9, help="SSIM threshold for detecting changes (lower means more sensitive, default: 0.9).")
     parser.add_argument("--md_name", help="Name for the output markdown file (default: same as output directory name with .md extension).")
+    parser.add_argument(
+        "--detect-width",
+        type=int,
+        default=240,
+        help="Low-res grayscale width used for slide-change detection (default: 240).",
+    )
     parser.add_argument(
         "--ppt_rect",
         help="Manual PPT crop rect in relative coordinates 'x1,y1,x2,y2' (each in [0,1]). "
@@ -1019,23 +1217,34 @@ def main():
     # 如果用户指定了手动矩形，就不再做动态检测，以避免尺寸变化导致的抖动
     use_dynamic = manual_rect is None
 
-    # 1. Extract frames
-    extracted_frames = extract_frames(
+    # 1. Detect changes using low-resolution in-memory frames.
+    detection_frames = extract_detection_frames(
         args.video_file,
         args.output_dir,
         args.interval,
         layout_info=layout_info,
         dynamic_layout=use_dynamic,
         max_duration_sec=args.max_duration,
+        detect_width=args.detect_width,
     )
 
-    # 2. Find slide changes
-    if extracted_frames:
-        slide_changes = find_slide_changes(extracted_frames, args.threshold)
-        # 3. Generate Markdown
-        generate_markdown(slide_changes, args.output_dir, args.md_name)
-    else:
-        print("No frames were extracted. Cannot proceed.")
+    if not detection_frames:
+        print("No detection frames were prepared. Cannot proceed.")
+        return
+
+    # 2. Find slide changes.
+    slide_changes = find_slide_changes(detection_frames, args.threshold)
+
+    # 3. Save only the selected high-resolution slide images.
+    slide_changes = materialize_slide_frames(
+        args.video_file,
+        slide_changes,
+        layout_info=layout_info,
+        dynamic_layout=use_dynamic,
+    )
+
+    # 4. Generate Markdown.
+    generate_markdown(slide_changes, args.output_dir, args.md_name)
 
 
 if __name__ == "__main__":
