@@ -1,7 +1,5 @@
 requests
 moviepy
-boto3
-botocore
 opencv-python
 scikit-image
 numpy

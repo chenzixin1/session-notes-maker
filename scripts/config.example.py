@@ -232,25 +232,19 @@ TRANSCRIPTION_USER_PROMPT = """Please transcribe the attached audio file accurat
 
 # Volcano Engine API Configuration
 
-# API Keys
-ACCESS_KEY = "YOUR_VOLCENGINE_ACCESS_KEY"
+# API key（新版控制台只需要这一项）
+VOLCENGINE_API_KEY = "YOUR_VOLCENGINE_API_KEY"
+# 旧版控制台如需双字段鉴权，再填写 APP_KEY，并把 Access Token 填到 ACCESS_KEY。
+APP_KEY = ""
+ACCESS_KEY = ""
 
-# API Endpoints
-SUBMIT_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
-QUERY_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
+# ASR Flash：本地音频 Base64 直传，一次请求直接返回识别结果
+RECOGNIZE_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
+RESOURCE_ID = "volc.bigasr.auc_turbo"
 
 # Default settings
-DEFAULT_LANGUAGE = "zh"
-DEFAULT_MAX_RETRIES = 60
-DEFAULT_RETRY_DELAY = 5  # seconds
+DEFAULT_LANGUAGE = "zh-CN"
 
 # Supported file formats
-SUPPORTED_AUDIO_FORMATS = ['.mp3', '.wav', '.flac', '.ogg']
+SUPPORTED_AUDIO_FORMATS = ['.mp3', '.wav', '.ogg']
 SUPPORTED_VIDEO_FORMATS = ['.mp4', '.avi', '.mov', '.mkv']
-
-# Cloudflare R2 Configuration
-R2_ENDPOINT_URL = "YOUR_R2_ENDPOINT_URL"  # 替换为你的R2端点URL
-R2_ACCESS_KEY_ID = "YOUR_R2_ACCESS_KEY_ID"  # 替换为你的访问密钥ID
-R2_SECRET_ACCESS_KEY = "YOUR_R2_SECRET_ACCESS_KEY"  # 替换为你的秘密访问密钥
-R2_BUCKET_NAME = "YOUR_R2_BUCKET_NAME"  # 替换为你的R2存储桶名称
-R2_PUBLIC_URL_PREFIX = "YOUR_R2_PUBLIC_URL_PREFIX"  # 替换为R2存储桶的公共访问URL前缀

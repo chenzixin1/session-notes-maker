@@ -142,8 +142,24 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, help="Default: <video_parent>/<video_stem>_html_output")
     parser.add_argument("--interactive", action="store_true", help="Open the PPT crop selector in step 02.")
     parser.add_argument("--ppt-rect", help="Manual PPT crop rect: x1,y1,x2,y2 in relative coordinates.")
+    parser.add_argument(
+        "--full-frame",
+        action="store_true",
+        help="Step 02: use entire video frame for screenshots and SSIM (no region crop or mixed-layout detection).",
+    )
     parser.add_argument("--interval", type=float, default=2.0)
     parser.add_argument("--threshold", type=float, default=0.9)
+    parser.add_argument(
+        "--output-max-side",
+        type=int,
+        default=0,
+        help="Step 02 streaming mode: resize saved screenshots to this longest side; 0 keeps original resolution.",
+    )
+    parser.add_argument(
+        "--legacy-extract-all",
+        action="store_true",
+        help="Step 02: save every sampled PNG before SSIM comparison instead of the faster streaming mode.",
+    )
     parser.add_argument("--threads", type=int, default=4, help="Threads for 04_polish_slide_transcript segments.")
     parser.add_argument("--compress-png", action="store_true", help="Compress referenced PNGs in the share folder.")
     parser.add_argument("--zip", action="store_true", help="Create a zip archive of the share folder.")
@@ -181,11 +197,17 @@ def main() -> None:
         str(args.threshold),
         "--md_name",
         slides_md.name,
+        "--output_max_side",
+        str(args.output_max_side),
     ]
     if args.interactive:
         cmd02.append("--interactive")
     if args.ppt_rect:
         cmd02.extend(["--ppt_rect", args.ppt_rect])
+    if args.full_frame:
+        cmd02.append("--full-frame")
+    if args.legacy_extract_all:
+        cmd02.append("--legacy_extract_all")
     run(cmd02)
 
     integrated_md = work_dir / f"{stem}_integrated.md"

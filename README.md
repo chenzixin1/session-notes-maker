@@ -1,6 +1,6 @@
 # Session Notes Maker 使用文档
 
-![Session Notes Maker 项目概览：输入视频和 PPT 区域，自动完成转录、截图识别、稿件对齐、轻量打磨，并通过 config.py 配置 OpenRouter、火山 ASR 和 Cloudflare R2](assets/session-notes-maker-overview.png)
+![Session Notes Maker 项目概览：输入视频和 PPT 区域，自动完成转录、截图识别、稿件对齐和轻量打磨；配置 OpenRouter 与火山 ASR](assets/session-notes-maker-overview.png)
 
 这个 Skill 用来把一段演讲、课程、会议或带 PPT 的视频，自动生成一份可分享的 HTML 图文稿。最终产物包含：
 
@@ -109,8 +109,6 @@ pip install -r ~/.cursor/skills/session-notes-maker/scripts/requirements.txt
 
 - `requests`
 - `moviepy`
-- `boto3`
-- `botocore`
 - `opencv-python`
 - `scikit-image`
 - `numpy`
@@ -163,11 +161,10 @@ cp ~/.cursor/skills/session-notes-maker/scripts/config.example.py \
 
 ## 4. 需要哪些模型和服务
 
-这条流水线依赖三类外部能力：
+这条流水线依赖两类外部能力：
 
 1. 火山引擎语音识别：把视频音频转成带时间戳的转录稿。
-2. Cloudflare R2：临时托管音频文件，让火山引擎 ASR 可以通过公网 URL 拉取。
-3. OpenRouter 多模态模型：读取幻灯片图片，结合转录稿做轻量打磨。
+2. OpenRouter 多模态模型：读取幻灯片图片，结合转录稿做轻量打磨。
 
 ### 4.1 OpenRouter 模型
 
@@ -201,32 +198,13 @@ google/gemini-2.5-flash
 配置项：
 
 ```python
-ACCESS_KEY = "YOUR_VOLCENGINE_ACCESS_KEY"
-SUBMIT_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
-QUERY_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
-DEFAULT_LANGUAGE = "zh"
+VOLCENGINE_API_KEY = "YOUR_VOLCENGINE_API_KEY"
+RECOGNIZE_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
+RESOURCE_ID = "volc.bigasr.auc_turbo"
+DEFAULT_LANGUAGE = "zh-CN"
 ```
 
-脚本使用的是火山引擎大模型语音识别接口，默认中文。
-
-### 4.3 Cloudflare R2
-
-配置项：
-
-```python
-R2_ENDPOINT_URL = "YOUR_R2_ENDPOINT_URL"
-R2_ACCESS_KEY_ID = "YOUR_R2_ACCESS_KEY_ID"
-R2_SECRET_ACCESS_KEY = "YOUR_R2_SECRET_ACCESS_KEY"
-R2_BUCKET_NAME = "YOUR_R2_BUCKET_NAME"
-R2_PUBLIC_URL_PREFIX = "YOUR_R2_PUBLIC_URL_PREFIX"
-```
-
-R2 的作用是：
-
-1. 本地从视频中抽取 MP3；
-2. 上传 MP3 到 R2；
-3. 生成公网可访问 URL；
-4. 把 URL 提交给火山引擎 ASR。
+脚本使用录音文件极速版 HTTP 接口。本地 MP3 会以 Base64 放入 `audio.data` 直接发送，一次请求返回结果，不需要临时对象存储或异步轮询。单文件限制为 2 小时、100MB，支持 WAV、MP3 和 OGG OPUS。
 
 ---
 
@@ -266,50 +244,26 @@ MODEL = "google/gemini-2.5-flash"
 
 1. 注册并登录火山引擎账号。
 2. 开通语音识别 / 大模型语音识别相关服务。
-3. 在控制台获取可调用语音识别接口的 `ACCESS_KEY`。
+3. 在新版控制台获取可调用语音识别接口的 API Key，并开通 `volc.bigasr.auc_turbo` 资源。
 4. 确认账号有调用额度、计费方式和权限。
 5. 将 key 填入：
 
 ```python
-ACCESS_KEY = "YOUR_VOLCENGINE_ACCESS_KEY"
+VOLCENGINE_API_KEY = "YOUR_VOLCENGINE_API_KEY"
 ```
 
 默认接口地址：
 
 ```python
-SUBMIT_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
-QUERY_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
+RECOGNIZE_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
+RESOURCE_ID = "volc.bigasr.auc_turbo"
 ```
 
 注意：
 
-- 音频文件必须能被火山引擎通过公网 URL 访问。
-- 所以本 Skill 使用 R2 托管音频文件。
-
-### 5.3 申请 Cloudflare R2
-
-步骤：
-
-1. 注册并登录 Cloudflare。
-2. 开通 R2 Object Storage。
-3. 创建一个 Bucket，例如 `mp4`。
-4. 创建 R2 API Token / Access Key。
-5. 记录：
-
-```python
-R2_ENDPOINT_URL = "..."
-R2_ACCESS_KEY_ID = "..."
-R2_SECRET_ACCESS_KEY = "..."
-R2_BUCKET_NAME = "..."
-```
-
-6. 配置 Bucket 的公网访问方式，得到可访问的 public URL 前缀：
-
-```python
-R2_PUBLIC_URL_PREFIX = "https://..."
-```
-
-7. 确认上传后的文件 URL 可以在浏览器或命令行中直接访问。
+- 新版控制台只需要 `VOLCENGINE_API_KEY`。
+- 旧版控制台需要同时配置 `APP_KEY` 与 `ACCESS_KEY`。
+- 音频不经过第三方存储；Base64 内容只发送到火山引擎识别接口。
 
 ---
 
@@ -320,10 +274,9 @@ R2_PUBLIC_URL_PREFIX = "https://..."
 ```text
 video.mp4
   -> 抽取 audio.mp3
-  -> 上传到 Cloudflare R2
-  -> 得到 public audio URL
-  -> 调用火山引擎 submit API
-  -> 轮询 query API
+  -> Base64 编码到 audio.data
+  -> 调用火山引擎 recognize/flash API
+  -> 同一次 HTTP 请求返回识别结果
   -> 写出 <video>_transcript.txt
 ```
 
@@ -468,10 +421,11 @@ runner 会在结束前检查 `<img src="...">` 引用是否都能找到。
 
 常见原因：
 
-- 火山引擎 `ACCESS_KEY` 不正确；
-- R2 上传失败；
-- R2 public URL 无法公网访问；
-- 音频太长或服务额度不足。
+- 火山引擎 `VOLCENGINE_API_KEY` 不正确；
+- 未开通 `volc.bigasr.auc_turbo` 资源；
+- 音频超过 2 小时或 100MB；
+- 音频格式不属于 WAV、MP3、OGG OPUS；
+- 服务额度不足或 HTTP 请求超时。
 
 ### 9.3 OpenRouter 调用失败
 
