@@ -9,8 +9,9 @@
 Usage:
     python 02_extract_slide_timestamps.py input_video.mp4 [-o OUTPUT_DIR] [-i INTERVAL] [-t THRESHOLD]
         [--md_name MD_NAME] [-I | --interactive] [--rect_file PATH] [--force_reselect]
-        [--ppt_rect x1,y1,x2,y2] [--max_duration SEC]
-        [--detect-width WIDTH]
+        [--ppt_rect x1,y1,x2,y2] [--full-frame] [--max_duration SEC]
+        [--legacy_extract_all] [--ssim_max_side INT] [--output_max_side INT]
+        [--detect-width WIDTH] [--detection-backend hybrid-keyframe|accurate]
 
 Example (auto):
     python 02_extract_slide_timestamps.py data/inputs/GDB/media/GDB.mp4 -o data/outputs/GDB/GDB_frames
@@ -34,6 +35,13 @@ import numpy as np
 import datetime
 import concurrent.futures  # Added for threading
 from typing import Dict, List, Optional, Tuple
+
+try:
+    import torch
+    from pytorch_msssim import ssim as torch_ssim
+except ImportError:
+    torch = None
+    torch_ssim = None
 
 def format_time(seconds):
     """Formats seconds into HH:MM:SS.ms string."""
@@ -432,6 +440,27 @@ def _detect_ppt_rect_in_single_frame(
         }
     )
     return layout
+
+def full_frame_layout(video_path: str) -> Dict[str, Optional[Tuple[int, int, int, int]]]:
+    """Use the entire frame as the extraction region (no PPT/speaker split)."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Warning: Could not open video file for dimensions: {video_path}")
+        return {"is_mixed": False, "ppt_rect": None, "video_rect": None, "frame_shape": (0, 0)}
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    if width <= 0 or height <= 0:
+        return {"is_mixed": False, "ppt_rect": None, "video_rect": None, "frame_shape": (0, 0)}
+    ppt_rect = _clamp_rect(0, 0, width, height, width, height)
+    print(f"Full-frame mode: using entire picture {width}x{height} (crop rect={ppt_rect}).")
+    return {
+        "is_mixed": False,
+        "ppt_rect": ppt_rect,
+        "video_rect": None,
+        "frame_shape": (height, width),
+    }
+
 
 def detect_mixed_layout(
     video_path: str,
@@ -1306,6 +1335,323 @@ def _gray_for_comparison(frame_info):
     return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
 
+def _make_frame_info(output_dir: str, current_time_sec: float) -> Dict[str, object]:
+    timestamp_str_file = format_time(current_time_sec).replace(":", "_").replace(".", "_")
+    img_filename = f"frame_{timestamp_str_file}.png"
+    img_path = os.path.join(output_dir, "ppt_pics", img_filename)
+    relative_path = os.path.join("ppt_pics", img_filename)
+    return {
+        "time_sec": current_time_sec,
+        "path": img_path,
+        "filename": img_filename,
+        "relative_path": relative_path,
+    }
+
+
+def _crop_to_ppt_region(frame: np.ndarray, active_layout=None) -> np.ndarray:
+    if not active_layout or not active_layout.get("ppt_rect"):
+        return frame
+
+    x, y, w, h = active_layout["ppt_rect"]
+    if w <= 0 or h <= 0:
+        print("Warning: PPT crop rectangle has non-positive dimensions. Falling back to full frame.")
+        return frame
+
+    x2 = min(x + w, frame.shape[1])
+    y2 = min(y + h, frame.shape[0])
+    x = max(0, min(x, frame.shape[1] - 1))
+    y = max(0, min(y, frame.shape[0] - 1))
+    if x < x2 and y < y2:
+        return frame[y:y2, x:x2].copy()
+
+    print("Warning: PPT crop rectangle invalid. Falling back to full frame.")
+    return frame
+
+
+def _prepare_gray_for_streaming_ssim(
+    frame: np.ndarray,
+    target_size: Optional[Tuple[int, int]],
+) -> np.ndarray:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if target_size is not None and (gray.shape[1], gray.shape[0]) != target_size:
+        gray = cv2.resize(gray, target_size, interpolation=cv2.INTER_AREA)
+    return gray
+
+
+def _streaming_ssim_changed(prev_gray: np.ndarray, curr_gray: np.ndarray, threshold: float) -> bool:
+    if prev_gray.shape != curr_gray.shape:
+        print("Warning: Streaming SSIM frame dimensions mismatch. Treating current frame as a change.")
+        return True
+    similarity_index = ssim(prev_gray, curr_gray, data_range=255)
+    return similarity_index < threshold
+
+
+def _resize_frame_max_side(frame: np.ndarray, max_side: int) -> np.ndarray:
+    if max_side <= 0:
+        return frame
+    height, width = frame.shape[:2]
+    largest_side = max(height, width)
+    if largest_side <= max_side:
+        return frame
+    scale = max_side / float(largest_side)
+    target_width = max(1, int(round(width * scale)))
+    target_height = max(1, int(round(height * scale)))
+    return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+
+def extract_slide_changes_streaming(
+    video_path,
+    output_dir,
+    interval_sec,
+    threshold,
+    layout_info=None,
+    dynamic_layout: bool = True,
+    layout_refresh_interval: float = 10.0,
+    max_duration_sec: float = None,
+    ssim_max_side: int = 512,
+    output_max_side: int = 0,
+):
+    """Extract only slide-change frames by comparing sampled frames in memory."""
+    print(
+        f"Streaming slide-change extraction from '{video_path}' every {interval_sec} seconds "
+        f"with SSIM threshold < {threshold}..."
+    )
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"Created directory: {output_dir}")
+
+    pics_dir = os.path.join(output_dir, "ppt_pics")
+    if not os.path.exists(pics_dir):
+        os.makedirs(pics_dir)
+        print(f"Created images directory: {pics_dir}")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error: Could not open video file {video_path}")
+        return []
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration_sec = total_frames / fps if fps > 0 else 0
+    if max_duration_sec is not None and max_duration_sec > 0:
+        duration_sec = min(duration_sec, max_duration_sec)
+        print(f"Limiting extraction to first {max_duration_sec} seconds ({format_time(max_duration_sec)})")
+
+    print(f"Video Info: FPS={fps:.2f}, Total Frames={total_frames}, Duration={format_time(duration_sec)}")
+
+    slide_changes = []
+    sampled_count = 0
+    saved_count = 0
+    current_layout = layout_info
+    last_layout_update_time = -1e9
+    prev_gray = None
+    target_size: Optional[Tuple[int, int]] = None
+    sample_stride_frames = max(1, int(round(fps * interval_sec))) if fps > 0 else 1
+    max_frame_id = int(duration_sec * fps) if fps > 0 else 0
+    frame_idx = 0
+
+    while frame_idx <= max_frame_id:
+        grabbed = cap.grab()
+        if not grabbed:
+            break
+        if frame_idx % sample_stride_frames != 0:
+            frame_idx += 1
+            continue
+
+        current_time_sec = frame_idx / fps if fps > 0 else sampled_count * interval_sec
+        ret, frame = cap.retrieve()
+        if not ret:
+            print(f"Warning: Could not read frame at {format_time(current_time_sec)}")
+            frame_idx += 1
+            continue
+
+        if dynamic_layout and (current_layout is None or current_time_sec - last_layout_update_time >= layout_refresh_interval):
+            current_layout = _detect_ppt_rect_in_single_frame(frame)
+            last_layout_update_time = current_time_sec
+            print(f"[Dynamic layout] t={format_time(current_time_sec)} PPT rect={current_layout.get('ppt_rect')}")
+
+        active_layout = current_layout if dynamic_layout else layout_info
+        frame_to_save = _crop_to_ppt_region(frame, active_layout)
+
+        if target_size is None:
+            gray_for_size = cv2.cvtColor(frame_to_save, cv2.COLOR_BGR2GRAY)
+            target_size = _target_ssim_size(gray_for_size.shape, ssim_max_side)
+            curr_gray = cv2.resize(gray_for_size, target_size, interpolation=cv2.INTER_AREA) if target_size is not None else gray_for_size
+        else:
+            curr_gray = _prepare_gray_for_streaming_ssim(frame_to_save, target_size)
+
+        sampled_count += 1
+        is_change = prev_gray is None or _streaming_ssim_changed(prev_gray, curr_gray, threshold)
+        if is_change:
+            frame_info = _make_frame_info(output_dir, current_time_sec)
+            frame_to_write = _resize_frame_max_side(frame_to_save, output_max_side)
+            cv2.imwrite(str(frame_info["path"]), frame_to_write)
+            slide_changes.append(frame_info)
+            saved_count += 1
+
+        prev_gray = curr_gray
+
+        if sampled_count % 20 == 0:
+            print(f"  Sampled {sampled_count} frames; saved {saved_count} slide-change frames at {format_time(current_time_sec)}")
+
+        frame_idx += 1
+        if interval_sec <= 0:
+             print("Error: Interval must be positive.")
+             break
+        if sampled_count > (duration_sec / interval_sec) * 2 and duration_sec > 0:
+            print("Warning: Sampled significantly more frames than expected. Stopping.")
+            break
+
+    cap.release()
+    print(f"Streaming extraction sampled {sampled_count} frames and saved {saved_count} slide-change frames.")
+    return slide_changes
+
+
+def _select_torch_ssim_device(backend: str):
+    """Return the best torch device for batch SSIM, or None if unavailable."""
+    if torch is None or torch_ssim is None:
+        return None
+
+    mps_backend = getattr(torch.backends, "mps", None)
+    if backend == "mps":
+        if mps_backend is not None and mps_backend.is_available():
+            return torch.device("mps")
+        return None
+
+    if mps_backend is not None and mps_backend.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def _target_ssim_size(gray_shape: Tuple[int, int], max_side: int) -> Optional[Tuple[int, int]]:
+    """Return OpenCV resize target (width, height), preserving aspect ratio."""
+    if max_side <= 0:
+        return None
+    height, width = gray_shape
+    largest_side = max(height, width)
+    if largest_side <= 0:
+        return None
+    scale = min(1.0, max_side / float(largest_side))
+    target_width = max(11, int(round(width * scale)))
+    target_height = max(11, int(round(height * scale)))
+    return target_width, target_height
+
+
+def _report_slide_changes(frame_list, slide_changes_indices):
+    """Build slide-change records and print the existing change report."""
+    sorted_indices = sorted(list(slide_changes_indices))
+    slide_changes = [frame_list[i] for i in sorted_indices]
+
+    print("Change detection report:")
+    if len(sorted_indices) > 1:
+        for k in range(1, len(sorted_indices)):
+             prev_idx = sorted_indices[k-1]
+             curr_idx = sorted_indices[k]
+             print(f"  Slide change identified: Frame {prev_idx} ({frame_list[prev_idx]['filename']}) -> Frame {curr_idx} ({frame_list[curr_idx]['filename']})")
+    elif len(sorted_indices) == 1:
+         print("  No significant changes detected after the first frame.")
+    else: # Should not happen due to initialization with {0}
+         print("  No frames identified.")
+
+    print(f"Found {len(slide_changes)} potential slide starts (including first frame).")
+    return slide_changes
+
+
+def _find_slide_changes_mps(frame_list, threshold=0.9, max_side=512, backend="auto"):
+    """Batch adjacent-frame SSIM with torch on Apple MPS when available."""
+    device = _select_torch_ssim_device(backend)
+    if device is None:
+        raise RuntimeError("torch/pytorch-msssim or requested torch device is unavailable")
+
+    print(f"Comparing {len(frame_list)} frames with batched SSIM threshold < {threshold}...")
+    if not frame_list or len(frame_list) < 2:
+        print("Not enough frames to compare.")
+        return frame_list
+
+    gray_frames: List[Optional[np.ndarray]] = []
+    first_valid_shape: Optional[Tuple[int, int]] = None
+    for frame_info in frame_list:
+        img = cv2.imread(frame_info["path"])
+        if img is None:
+            print(f"Warning: Could not read image for comparison: {frame_info['path']}")
+            gray_frames.append(None)
+            continue
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if first_valid_shape is None:
+            first_valid_shape = gray.shape
+        gray_frames.append(gray)
+
+    if first_valid_shape is None:
+        print("No readable frames to compare.")
+        return _report_slide_changes(frame_list, {0})
+
+    target_size = _target_ssim_size(first_valid_shape, max_side)
+    if target_size is not None:
+        resized_frames: List[Optional[np.ndarray]] = []
+        for gray in gray_frames:
+            if gray is None:
+                resized_frames.append(None)
+            elif (gray.shape[1], gray.shape[0]) != target_size:
+                resized_frames.append(cv2.resize(gray, target_size, interpolation=cv2.INTER_AREA))
+            else:
+                resized_frames.append(gray)
+        gray_frames = resized_frames
+
+    valid_pairs = []
+    for i in range(1, len(gray_frames)):
+        prev_gray = gray_frames[i - 1]
+        curr_gray = gray_frames[i]
+        if prev_gray is None or curr_gray is None:
+            continue
+        if prev_gray.shape != curr_gray.shape:
+            print(f"Warning: Frame dimensions mismatch between {frame_list[i - 1]['path']} and {frame_list[i]['path']}. Skipping comparison.")
+            continue
+        valid_pairs.append((i, prev_gray, curr_gray))
+
+    if not valid_pairs:
+        print("No valid adjacent frame pairs to compare.")
+        return _report_slide_changes(frame_list, {0})
+
+    sample_height, sample_width = valid_pairs[0][1].shape
+    bytes_per_pair = max(1, 2 * sample_height * sample_width * 4)
+    chunk_size = max(1, min(64, (256 * 1024 * 1024) // bytes_per_pair))
+    max_side_label = "original" if max_side <= 0 else str(max_side)
+    print(f"[SSIM] backend={device.type} device={device} max_side={max_side_label} chunk_size={chunk_size} pairs={len(valid_pairs)}")
+
+    slide_changes_indices = {0}
+    processed_count = 0
+
+    with torch.no_grad():
+        start = 0
+        while start < len(valid_pairs):
+            chunk_shape = valid_pairs[start][1].shape
+            end = start
+            while end < len(valid_pairs) and end - start < chunk_size and valid_pairs[end][1].shape == chunk_shape:
+                end += 1
+
+            chunk = valid_pairs[start:end]
+            prev_batch = np.stack([pair[1] for pair in chunk]).astype(np.float32) / 255.0
+            curr_batch = np.stack([pair[2] for pair in chunk]).astype(np.float32) / 255.0
+            prev_tensor = torch.from_numpy(prev_batch).unsqueeze(1).to(device)
+            curr_tensor = torch.from_numpy(curr_batch).unsqueeze(1).to(device)
+
+            scores = torch_ssim(prev_tensor, curr_tensor, data_range=1.0, size_average=False)
+            scores_np = scores.detach().cpu().numpy()
+            for (frame_index, _, _), score in zip(chunk, scores_np):
+                if float(score) < threshold:
+                    slide_changes_indices.add(frame_index)
+
+            processed_count += len(chunk)
+            if processed_count % 50 == 0 or processed_count == len(valid_pairs):
+                print(f"  Completed {processed_count}/{len(valid_pairs)} comparison tasks...")
+            start = end
+
+    return _report_slide_changes(frame_list, slide_changes_indices)
+
+
 def compare_frame_pair(prev_frame_info, current_frame_info, threshold, index):
     """Helper function to compare a single pair of frames for SSIM."""
     try:
@@ -1336,7 +1682,7 @@ def compare_frame_pair(prev_frame_info, current_frame_info, threshold, index):
         print(f"Error comparing frames {prev_frame_info['path']} and {current_frame_info['path']} (Index {index}): {e}")
         return None # Return None on error
 
-def find_slide_changes(frame_list, threshold=0.9):
+def _find_slide_changes_cpu(frame_list, threshold=0.9):
     """Compares adjacent frames in parallel to find significant changes."""
     print(f"Comparing {len(frame_list)} frames in parallel with SSIM threshold < {threshold}...")
     if not frame_list or len(frame_list) < 2:
@@ -1368,25 +1714,28 @@ def find_slide_changes(frame_list, threshold=0.9):
                  print(f"  Completed {processed_count}/{len(tasks)} comparison tasks...")
 
 
-    # Sort the indices and build the final list of slide changes
-    sorted_indices = sorted(list(slide_changes_indices))
-    slide_changes = [frame_list[i] for i in sorted_indices]
-
-    # Reporting changes detected
-    print("Change detection report:")
-    if len(sorted_indices) > 1:
-        for k in range(1, len(sorted_indices)):
-             prev_idx = sorted_indices[k-1]
-             curr_idx = sorted_indices[k]
-             print(f"  Slide change identified: Frame {prev_idx} ({frame_list[prev_idx]['filename']}) -> Frame {curr_idx} ({frame_list[curr_idx]['filename']})")
-    elif len(sorted_indices) == 1:
-         print("  No significant changes detected after the first frame.")
-    else: # Should not happen due to initialization with {0}
-         print("  No frames identified.")
+    return _report_slide_changes(frame_list, slide_changes_indices)
 
 
-    print(f"Found {len(slide_changes)} potential slide starts (including first frame).")
-    return slide_changes
+def find_slide_changes(frame_list, threshold=0.9, backend="auto", max_side=512):
+    """Find slide changes with an accelerated torch backend when available."""
+    backend = (backend or "auto").lower()
+    if backend not in {"auto", "mps", "cpu"}:
+        print(f"Warning: Unknown SSIM backend '{backend}'. Falling back to auto.")
+        backend = "auto"
+
+    if backend in {"auto", "mps"}:
+        try:
+            return _find_slide_changes_mps(
+                frame_list,
+                threshold=threshold,
+                max_side=max_side,
+                backend=backend,
+            )
+        except Exception as e:
+            print(f"[SSIM] MPS path failed ({e}); falling back to CPU.")
+
+    return _find_slide_changes_cpu(frame_list, threshold)
 
 def generate_markdown(slide_changes, output_dir, md_filename="ppt_timestamps.md"):
     """Generates a Markdown file listing slide changes with timestamps and images."""
@@ -1429,6 +1778,24 @@ def main():
     parser.add_argument("-o", "--output_dir", help="Directory to save extracted frames and markdown file (default: input_filename_YYYYMMDDHHMMSS).")
     parser.add_argument("-i", "--interval", type=float, default=2.0, help="Interval in seconds between frame captures (default: 2.0).")
     parser.add_argument("-t", "--threshold", type=float, default=0.9, help="SSIM threshold for detecting changes (lower means more sensitive, default: 0.9).")
+    parser.add_argument(
+        "--ssim_backend",
+        choices=("auto", "mps", "cpu"),
+        default="auto",
+        help="SSIM comparison backend: auto tries Apple MPS acceleration when available, mps requires Apple MPS, cpu uses the legacy skimage path (default: auto).",
+    )
+    parser.add_argument(
+        "--ssim_max_side",
+        type=int,
+        default=512,
+        help="Resize frames so their longest side is at most this many pixels before accelerated SSIM; set 0 to use original resolution (default: 512).",
+    )
+    parser.add_argument(
+        "--output_max_side",
+        type=int,
+        default=0,
+        help="Streaming mode: resize saved slide screenshots so their longest side is at most this many pixels; set 0 to keep original resolution (default: 0).",
+    )
     parser.add_argument("--md_name", help="Name for the output markdown file (default: same as output directory name with .md extension).")
     parser.add_argument(
         "--detect-width",
@@ -1489,6 +1856,16 @@ def main():
         type=float,
         help="Maximum duration in seconds to process (e.g., 180 for 3 minutes). If not set, processes entire video.",
     )
+    parser.add_argument(
+        "--full-frame",
+        action="store_true",
+        help="Use the entire video frame for screenshots and SSIM (no PPT region crop, no mixed-layout heuristics, no dynamic per-frame crop).",
+    )
+    parser.add_argument(
+        "--legacy_extract_all",
+        action="store_true",
+        help="Use the old two-pass flow: save every sampled frame, then compare saved PNGs. By default, only slide-change frames are saved.",
+    )
 
     args = parser.parse_args()
 
@@ -1502,6 +1879,14 @@ def main():
 
     if not (0 < args.threshold <= 1.0):
         print("Error: SSIM threshold must be between 0 and 1.")
+        return
+
+    if args.ssim_max_side < 0:
+        print("Error: --ssim_max_side must be 0 or a positive integer.")
+        return
+
+    if args.output_max_side < 0:
+        print("Error: --output_max_side must be 0 or a positive integer.")
         return
 
     # Set default output directory if not specified
@@ -1518,7 +1903,12 @@ def main():
         print(f"No markdown filename specified. Using default: {args.md_name}")
 
     manual_rect: Optional[Tuple[float, float, float, float]] = None
-    if args.ppt_rect:
+    if args.full_frame:
+        if args.ppt_rect:
+            print("Warning: --full-frame ignores --ppt_rect.")
+        if args.interactive:
+            print("Note: --interactive is ignored when --full-frame is set.")
+    elif args.ppt_rect:
         try:
             parts = [float(p.strip()) for p in args.ppt_rect.split(",")]
             if len(parts) != 4:
@@ -1532,14 +1922,14 @@ def main():
     rect_file = args.rect_file or _default_rect_file(args.video_file)
 
     # If no explicit --ppt_rect, try loading from sidecar file (unless forced to reselect)
-    if manual_rect is None and not args.force_reselect:
+    if not args.full_frame and manual_rect is None and not args.force_reselect:
         loaded = load_rect_file(rect_file)
         if loaded is not None:
             manual_rect = loaded
             print(f"Loaded PPT rect from sidecar file: {rect_file} -> {manual_rect}")
 
     # Interactive mode: let the user draw the rect with the mouse
-    if args.interactive:
+    if not args.full_frame and args.interactive:
         picked = interactive_select_ppt_rect(
             args.video_file,
             initial_rect_relative=manual_rect,
@@ -1571,15 +1961,39 @@ def main():
                 rect_absolute=rect_abs,
             )
 
-    layout_info = detect_mixed_layout(args.video_file, manual_rect=manual_rect)
-    if layout_info.get("ppt_rect"):
-        print(f"Using PPT crop rect: {layout_info.get('ppt_rect')} (is_mixed={layout_info.get('is_mixed')})")
+    if args.full_frame:
+        layout_info = full_frame_layout(args.video_file)
+        use_dynamic = False
+    else:
+        layout_info = detect_mixed_layout(args.video_file, manual_rect=manual_rect)
+        if layout_info.get("ppt_rect"):
+            print(f"Using PPT crop rect: {layout_info.get('ppt_rect')} (is_mixed={layout_info.get('is_mixed')})")
+        # 如果用户指定了手动矩形，就不再做动态检测，以避免尺寸变化导致的抖动
+        use_dynamic = manual_rect is None
 
-    # 如果用户指定了手动矩形，就不再做动态检测，以避免尺寸变化导致的抖动
-    use_dynamic = manual_rect is None
+    if args.legacy_extract_all:
+        # 1. Extract every sampled frame, then compare saved PNGs.
+        extracted_frames = extract_frames(
+            args.video_file,
+            args.output_dir,
+            args.interval,
+            layout_info=layout_info,
+            dynamic_layout=use_dynamic,
+            max_duration_sec=args.max_duration,
+        )
 
-    slide_changes = None
-    if args.detection_backend == "hybrid-keyframe" and not use_dynamic:
+        # 2. Find slide changes
+        if extracted_frames:
+            slide_changes = find_slide_changes(
+                extracted_frames,
+                args.threshold,
+                backend=args.ssim_backend,
+                max_side=args.ssim_max_side,
+            )
+        else:
+            print("No frames were extracted. Cannot proceed.")
+            return
+    elif args.detection_backend == "hybrid-keyframe" and not use_dynamic:
         slide_changes = hybrid_keyframe_slide_changes(
             args.video_file,
             args.output_dir,
@@ -1594,39 +2008,45 @@ def main():
         if slide_changes is None:
             print("Hybrid keyframe mode unavailable; falling back to accurate full scan.")
 
-    if slide_changes is None:
-        # 1. Detect changes using low-resolution in-memory frames.
-        detection_frames = extract_detection_frames(
+        if slide_changes is not None:
+            slide_changes = materialize_slide_frames(
+                args.video_file,
+                slide_changes,
+                layout_info=layout_info,
+                dynamic_layout=False,
+                image_format=args.image_format,
+                jpeg_quality=args.jpeg_quality,
+                workers=args.materialize_workers,
+            )
+        else:
+            slide_changes = extract_slide_changes_streaming(
+                args.video_file,
+                args.output_dir,
+                args.interval,
+                args.threshold,
+                layout_info=layout_info,
+                dynamic_layout=use_dynamic,
+                max_duration_sec=args.max_duration,
+                ssim_max_side=args.ssim_max_side,
+                output_max_side=args.output_max_side,
+            )
+    else:
+        slide_changes = extract_slide_changes_streaming(
             args.video_file,
             args.output_dir,
             args.interval,
+            args.threshold,
             layout_info=layout_info,
             dynamic_layout=use_dynamic,
             max_duration_sec=args.max_duration,
-            detect_width=args.detect_width,
-            image_format=args.image_format,
+            ssim_max_side=args.ssim_max_side,
+            output_max_side=args.output_max_side,
         )
 
-        if not detection_frames:
-            print("No detection frames were prepared. Cannot proceed.")
-            return
-
-        # 2. Find slide changes.
-        slide_changes = find_slide_changes(detection_frames, args.threshold)
-
-    # 3. Save only the selected high-resolution slide images.
-    slide_changes = materialize_slide_frames(
-        args.video_file,
-        slide_changes,
-        layout_info=layout_info,
-        dynamic_layout=use_dynamic,
-        image_format=args.image_format,
-        jpeg_quality=args.jpeg_quality,
-        workers=args.materialize_workers,
-    )
-
-    # 4. Generate Markdown.
-    generate_markdown(slide_changes, args.output_dir, args.md_name)
+    if slide_changes:
+        generate_markdown(slide_changes, args.output_dir, args.md_name)
+    else:
+        print("No slide-change frames were extracted. Cannot proceed.")
 
 
 if __name__ == "__main__":
