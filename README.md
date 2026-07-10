@@ -1,6 +1,6 @@
 # Session Notes Maker 使用文档
 
-![Session Notes Maker 项目概览：输入视频和 PPT 区域，自动完成转录、截图识别、稿件对齐和轻量打磨；配置 OpenRouter 与火山 ASR](assets/session-notes-maker-overview.png)
+![Session Notes Maker 项目概览：火山 ASR 转录视频，Codex sub-agent 并行校对和轻量打磨，只需配置 VOLCENGINE_API_KEY](assets/session-notes-maker-overview.png)
 
 这个 Skill 用来把一段演讲、课程、会议或带 PPT 的视频，自动生成一份可分享的 HTML 图文稿。最终产物包含：
 
@@ -149,7 +149,7 @@ cp ~/.cursor/skills/session-notes-maker/scripts/config.example.py \
    ~/.cursor/skills/session-notes-maker/scripts/config.py
 ```
 
-然后填写 `scripts/config.py` 中的 API Key 和服务配置。
+然后只需填写 `scripts/config.py` 中的 `VOLCENGINE_API_KEY`。Codex sub-agent 使用当前 Codex 会话，不需要额外模型 API Key。
 
 注意：
 
@@ -161,37 +161,13 @@ cp ~/.cursor/skills/session-notes-maker/scripts/config.example.py \
 
 ## 4. 需要哪些模型和服务
 
-这条流水线依赖两类外部能力：
+默认 Codex 路径只依赖一项外部服务：火山引擎语音识别。它负责把视频音频转成带时间戳的转录稿。
 
-1. 火山引擎语音识别：把视频音频转成带时间戳的转录稿。
-2. OpenRouter 多模态模型：读取幻灯片图片，结合转录稿做轻量打磨。
+图片理解、术语校对和 `light-plus` 轻量打磨由当前 Codex 会话中的多个 sub-agent 并行完成，不需要 OpenRouter，也不需要额外模型 API Key。
 
-### 4.1 OpenRouter 模型
+### 4.1 Codex sub-agent
 
-默认模型在 `scripts/config.py` 中：
-
-```python
-BASE_URL = "https://openrouter.ai/api/v1"
-MODEL = "google/gemini-2.5-flash"
-```
-
-推荐默认使用：
-
-```text
-google/gemini-2.5-flash
-```
-
-原因：
-
-- 支持图像输入，能读取幻灯片截图。
-- 成本和速度相对适合批量处理。
-- 用于本 Skill 的 `light-plus` 轻量打磨模式已经足够。
-
-如果你希望更高质量，可以换成 OpenRouter 支持的其它多模态模型，但必须满足：
-
-- 支持 image input；
-- 支持中文；
-- 上下文长度足够处理单页幻灯片和对应转录文本。
+Codex 会把逐页 PPT 截图和对应转录稿拆成互不重叠的批次，交给多个 sub-agent 并行生成 `codex_notes/slide_N.md`，再由本地脚本汇总。最终稿严格保持一页 PPT 对应一段完整讲稿。
 
 ### 4.2 火山引擎 ASR
 
@@ -210,35 +186,7 @@ DEFAULT_LANGUAGE = "zh-CN"
 
 ## 5. API 怎么申请
 
-### 5.1 申请 OpenRouter API Key
-
-步骤：
-
-1. 打开 OpenRouter 官网并注册账号。
-2. 进入 API Keys 页面。
-3. 创建一个新的 API Key。
-4. 复制 key，填入：
-
-```python
-API_KEY = "YOUR_OPENROUTER_API_KEY"
-```
-
-5. 确认账号余额或额度足够。
-6. 确认模型名可用，例如：
-
-```python
-MODEL = "google/gemini-2.5-flash"
-```
-
-OpenRouter 的调用方式由 `openai` Python SDK 兼容接口完成，关键配置是：
-
-```python
-BASE_URL = "https://openrouter.ai/api/v1"
-API_KEY = "YOUR_OPENROUTER_API_KEY"
-MODEL = "google/gemini-2.5-flash"
-```
-
-### 5.2 申请火山引擎语音识别
+### 5.1 申请火山引擎语音识别
 
 步骤：
 
@@ -290,9 +238,10 @@ scripts/01_transcribe_video.py
 
 ```text
 每一页幻灯片截图 + 对应转录文本
-  -> OpenRouter chat/completions 兼容接口
-  -> google/gemini-2.5-flash
-  -> 生成轻量打磨后的段落
+  -> Codex 拆分互不重叠的批次
+  -> 多个 Codex sub-agent 并行校对与轻量打磨
+  -> codex_notes/slide_N.md
+  -> 本地汇总为一页 PPT 对应一段完整讲稿
 ```
 
 对应脚本：
@@ -450,14 +399,14 @@ runner 会在结束前检查 `<img src="...">` 引用是否都能找到。
 - 音频格式不属于 WAV、MP3、OGG OPUS；
 - 服务额度不足或 HTTP 请求超时。
 
-### 9.3 OpenRouter 调用失败
+### 9.3 Codex notes 没有生成或没有生效
 
 检查：
 
-- `API_KEY` 是否有效；
-- 账号是否有余额；
-- `MODEL` 是否支持图片输入；
-- 网络是否能访问 OpenRouter。
+- 是否先运行 `05_prepare_codex_batches.py`；
+- 每个 sub-agent 是否只写自己负责的 `slide_N.md`；
+- `--codex-notes-dir` 是否指向正确目录；
+- 是否使用 `--polish-provider codex-notes` 汇总。
 
 ### 9.4 图片压缩后仍然很大
 
