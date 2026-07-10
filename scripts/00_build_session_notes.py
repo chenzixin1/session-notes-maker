@@ -220,8 +220,8 @@ def main() -> None:
     parser.add_argument(
         "--polish-provider",
         choices=["openrouter", "codex-notes", "passthrough"],
-        default="openrouter",
-        help="openrouter keeps the original LLM flow; codex-notes reads Codex-authored notes; passthrough keeps aligned transcript text.",
+        default="passthrough",
+        help="passthrough is the no-key default; codex-notes reads Codex sub-agent notes; openrouter is optional legacy compatibility.",
     )
     parser.add_argument(
         "--codex-notes-dir",

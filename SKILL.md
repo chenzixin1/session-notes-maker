@@ -64,10 +64,11 @@ pip install "torch>=2.1" "pytorch-msssim>=1.0"
 cp ~/.cursor/skills/session-notes-maker/scripts/config.example.py ~/.cursor/skills/session-notes-maker/scripts/config.py
 ```
 
-然后填写：
+然后只需填写：
 
-- `API_KEY`：OpenRouter
 - `VOLCENGINE_API_KEY`：火山引擎新版控制台的 API Key
+
+默认 Codex sub-agent 路径不需要 OpenRouter Key。`API_KEY`、`BASE_URL` 和 `MODEL` 只为兼容旧的 OpenRouter provider 保留，均为可选配置。
 
 转录脚本使用火山引擎录音文件极速版 HTTP 接口，把本地音频 Base64 编码后放入 `audio.data` 直接发送。无需对象存储、公网音频 URL，也无需 submit/query 轮询。旧版控制台鉴权可额外配置 `APP_KEY` 和 `ACCESS_KEY`。
 
@@ -79,49 +80,32 @@ cp ~/.cursor/skills/session-notes-maker/scripts/config.example.py ~/.cursor/skil
 
 ## 推荐命令
 
-### 路径 A：OpenRouter 自动处理
+### 路径 A：Codex sub-agent（默认）
 
-使用 helper 脚本，保持原始自动化路径：
+先使用 helper 脚本完成转写、截图和稿件对齐；默认 `passthrough` 不会调用 OpenRouter：
 
 ```bash
-python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/path/to/video.mp4" --interactive --zip
+python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/path/to/video.mp4" \
+  --interactive \
+  --polish-provider passthrough
 ```
 
 如果视频旁边已经有保存好的 PPT 截图区域 sidecar（`<video>.ppt_rect.json`），可以省略 `--interactive`：
 
 ```bash
-python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/path/to/video.mp4" --zip
+python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/path/to/video.mp4" \
+  --polish-provider passthrough
 ```
 
 如果一批视频画面布局一致，可以复用已知截图区域：
 
 ```bash
-python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/path/to/video.mp4" --ppt-rect "0.0359,0.0806,0.6792,0.7296" --zip
-```
-
-### 路径 B：Codex 友好处理
-
-当 OpenRouter key 不可用，或当前执行者（如 Codex）可以直接读图时，保留前 3 步的本地处理和火山 ASR，只把第 4 步切到 Codex 友好路径。
-
-保底生成未打磨但已对齐的 HTML：
-
-```bash
 python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/path/to/video.mp4" \
   --ppt-rect "0.0359,0.0806,0.6792,0.7296" \
-  --polish-provider passthrough \
-  --zip
+  --polish-provider passthrough
 ```
 
-如果 Codex 已经逐页读图并生成 notes，可使用：
-
-```bash
-python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/path/to/video.mp4" \
-  --ppt-rect "0.0359,0.0806,0.6792,0.7296" \
-  --polish-provider codex-notes \
-  --codex-notes-dir "/path/to/codex_notes" \
-  --embed-html-images \
-  --zip
-```
+然后使用 `05_prepare_codex_batches.py` 准备批次，让多个 sub-agent 并行生成 notes，再用 `--provider codex-notes` 汇总并运行 `06_merge_light_polish_scenes.py`。
 
 `codex_notes` 中每页可以使用以下文件名之一：
 
@@ -141,9 +125,7 @@ python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/
 这里放 Codex 结合图片和该页口述稿整理后的正文。
 ```
 
-如果没有 `## 轻量打磨稿`，脚本会把 `## 幻灯片要点` 和清理后的口述稿一起写入最终 Markdown。
-
-如果需要在 Codex 中并行使用多个 sub-agent，可以先按批次准备输入：
+如果需要并行处理，先准备批次：
 
 ```bash
 python ~/.cursor/skills/session-notes-maker/scripts/05_prepare_codex_batches.py \
@@ -154,10 +136,21 @@ python ~/.cursor/skills/session-notes-maker/scripts/05_prepare_codex_batches.py 
   --batch-size 10
 ```
 
-然后把不同的 `batch_XX.md` 分配给不同 sub-agent。每个 agent 只写自己负责页码的
-`slide_N.md` 到同一个 `codex_notes` 目录；所有批次完成后，继续使用
-`--polish-provider codex-notes --codex-notes-dir /path/to/codex_notes` 汇总。
-这样可以并行打磨，同时保持每页文件的写入边界清晰。
+每个 sub-agent 只写自己负责页码的 `slide_N.md`。所有批次完成后，使用
+`--provider codex-notes --codex-notes-dir /path/to/codex_notes` 汇总。
+
+### 路径 B：OpenRouter（可选兼容）
+
+只有明确需要旧 OpenRouter 自动路径时，才配置 `API_KEY` 并显式传入 `--polish-provider openrouter`。
+
+调用方式：
+
+```bash
+python ~/.cursor/skills/session-notes-maker/scripts/00_build_session_notes.py "/path/to/video.mp4" \
+  --ppt-rect "0.0359,0.0806,0.6792,0.7296" \
+  --polish-provider openrouter \
+  --zip
+```
 
 ## 工作流程
 
@@ -184,8 +177,8 @@ python ~/.cursor/skills/session-notes-maker/scripts/05_prepare_codex_batches.py 
    - 输出：`<video>_integrated.md`。
 
 4. **使用轻量打磨模式处理**
-   - 默认路径保持原来的 OpenRouter 自动处理。
-   - Codex 友好路径可用 `--polish-provider codex-notes` 或 `--polish-provider passthrough`，不依赖 OpenRouter key。
+   - 默认先用 `passthrough` 保留对齐稿，再由多个 Codex sub-agent 并行生成 notes，最后用 `--polish-provider codex-notes` 汇总。
+   - 这条默认路径不依赖 OpenRouter Key；`--polish-provider openrouter` 仅作为可选兼容路径保留。
    - 运行 `04_polish_slide_transcript.py`，常用参数：
      - `--mode light-plus`
      - `--provider openrouter|codex-notes|passthrough`
