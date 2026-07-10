@@ -23,6 +23,7 @@ import time
 import concurrent.futures
 from threading import Lock
 import shutil
+import re
 
 import config
 import markdown_llm_utils as utils
@@ -95,6 +96,91 @@ def _get_mode_prompts(mode: str) -> tuple[str, str]:
     )
 
 
+def _strip_speaker_labels(text: str) -> str:
+    """Light cleanup that is safe without an LLM."""
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"^\s*说话人\d+\s*[:：]\s*", "", line)
+        lines.append(line.rstrip())
+    return "\n".join(lines).strip()
+
+
+def _section_after_heading(text: str, heading_patterns: list[str]) -> str:
+    """Extract a Markdown section by heading name, returning empty string if absent."""
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        normalized = line.strip().lower()
+        if any(re.match(pattern, normalized, re.IGNORECASE) for pattern in heading_patterns):
+            start = i + 1
+            break
+    if start is None:
+        return ""
+    end = len(lines)
+    for j in range(start, len(lines)):
+        if re.match(r"^\s{0,3}#{1,6}\s+", lines[j]):
+            end = j
+            break
+    return "\n".join(lines[start:end]).strip()
+
+
+def _find_codex_note(notes_dir: str, idx: int, image_path: str) -> str:
+    """Find a Codex-authored note for one slide segment."""
+    if not notes_dir:
+        return ""
+    image_stem = os.path.splitext(os.path.basename(image_path))[0]
+    candidates = [
+        f"slide_{idx + 1:02d}.md",
+        f"slide_{idx + 1}.md",
+        f"{idx + 1:02d}_{image_stem}.md",
+        f"{idx + 1}_{image_stem}.md",
+        f"{image_stem}.md",
+    ]
+    for name in candidates:
+        path = os.path.join(notes_dir, name)
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+    return ""
+
+
+def _apply_codex_note(idx: int, segment: dict, image_path: str, notes_dir: str) -> dict:
+    """Use Codex-authored notes to build a processed segment without OpenRouter."""
+    note = _find_codex_note(notes_dir, idx, image_path)
+    cleaned_transcript = _strip_speaker_labels(segment["text"])
+    if not note:
+        return {
+            "header": segment.get("header"),
+            "images": segment["images"],
+            "text": cleaned_transcript,
+        }
+
+    polished = _section_after_heading(
+        note,
+        [
+            r"^#+\s*(lightly\s+polished\s+transcript|polished\s+transcript|final\s+text)\s*$",
+            r"^#+\s*(轻量打磨稿|整理稿|最终稿|正文)\s*$",
+        ],
+    )
+    if polished:
+        text = polished
+    else:
+        slide_notes = _section_after_heading(
+            note,
+            [
+                r"^#+\s*(slide\s+context|image\s+notes|slide\s+notes)\s*$",
+                r"^#+\s*(幻灯片要点|图片要点|校对要点)\s*$",
+            ],
+        ) or note
+        text = f"**幻灯片校对要点**\n\n{slide_notes}\n\n**口述稿**\n\n{cleaned_transcript}"
+
+    return {
+        "header": segment.get("header"),
+        "images": segment["images"],
+        "text": text.strip(),
+    }
+
+
 def process_markdown(
     input_path: str,
     output_path: str,
@@ -102,6 +188,8 @@ def process_markdown(
     num_threads: int = 5,
     mode: str = "rewrite",
     no_review: bool = False,
+    provider: str = "openrouter",
+    codex_notes_dir: str = "",
 ) -> None:
     """
     Process a Markdown file containing presentation transcript.
@@ -155,13 +243,18 @@ def process_markdown(
     updated_segments = utils.read_temp_markdown(temp_path)
     print(f"Found {len(updated_segments)} segments in the updated file.")
 
-    # Set up OpenAI client for OpenRoute
-    client = utils.get_client(
-        config.API_KEY,
-        config.BASE_URL,
-        config.SITE_URL,
-        config.SITE_NAME
-    )
+    if provider == "codex-notes" and not codex_notes_dir:
+        raise SystemExit("--provider codex-notes requires --codex-notes-dir")
+
+    # Set up OpenAI client for OpenRouter only on the original path.
+    client = None
+    if provider == "openrouter":
+        client = utils.get_client(
+            config.API_KEY,
+            config.BASE_URL,
+            config.SITE_URL,
+            config.SITE_NAME
+        )
 
     describe_prompt, integration_prompt_template = _get_mode_prompts(mode)
 
@@ -194,6 +287,20 @@ def process_markdown(
             with progress_lock:
                 print(f"Segment {idx+1}: Image not found: {image_path}")
             return segment
+
+        if provider == "passthrough":
+            with progress_lock:
+                print(f"Segment {idx+1}: passthrough provider; keeping aligned transcript text.")
+            return {
+                "header": segment.get("header"),
+                "images": segment["images"],
+                "text": _strip_speaker_labels(segment["text"]),
+            }
+
+        if provider == "codex-notes":
+            with progress_lock:
+                print(f"Segment {idx+1}: using Codex notes from {codex_notes_dir}")
+            return _apply_codex_note(idx, segment, image_path, codex_notes_dir)
 
         # Step 1: Describe the slide
         with progress_lock:
@@ -298,30 +405,31 @@ def process_markdown(
     print(f"\nEstimated total cost: ${utils.total_cost:.6f}")
     logging.info(f"Estimated total cost: ${utils.total_cost:.6f}")
 
-    # Get actual usage from OpenRouter
-    print("\nGetting actual usage from OpenRouter...")
-    usage_data = utils.get_openrouter_usage(config.API_KEY)
-    if 'error' not in usage_data:
-        if 'data' in usage_data:
-            # 新版API响应格式
-            if 'usage' in usage_data['data']:
-                spend = usage_data['data']['usage']
-                print(f"Actual spend according to OpenRouter: ${spend:.6f}")
-                logging.info(f"Actual spend according to OpenRouter: ${spend:.6f}")
-            # 旧版API响应格式
-            elif 'key' in usage_data['data'] and 'spend' in usage_data['data']['key']:
-                spend = usage_data['data']['key']['spend']
-                print(f"Actual spend according to OpenRouter: ${spend:.6f}")
-                logging.info(f"Actual spend according to OpenRouter: ${spend:.6f}")
+    if provider == "openrouter":
+        # Get actual usage from OpenRouter
+        print("\nGetting actual usage from OpenRouter...")
+        usage_data = utils.get_openrouter_usage(config.API_KEY)
+        if 'error' not in usage_data:
+            if 'data' in usage_data:
+                # 新版API响应格式
+                if 'usage' in usage_data['data']:
+                    spend = usage_data['data']['usage']
+                    print(f"Actual spend according to OpenRouter: ${spend:.6f}")
+                    logging.info(f"Actual spend according to OpenRouter: ${spend:.6f}")
+                # 旧版API响应格式
+                elif 'key' in usage_data['data'] and 'spend' in usage_data['data']['key']:
+                    spend = usage_data['data']['key']['spend']
+                    print(f"Actual spend according to OpenRouter: ${spend:.6f}")
+                    logging.info(f"Actual spend according to OpenRouter: ${spend:.6f}")
+                else:
+                    print("Spend information not available from OpenRouter.")
+                    logging.info("Spend information not available from OpenRouter.")
             else:
-                print("Spend information not available from OpenRouter.")
-                logging.info("Spend information not available from OpenRouter.")
+                print("Unexpected response format from OpenRouter.")
+                logging.info(f"Unexpected response format from OpenRouter: {usage_data}")
         else:
-            print("Unexpected response format from OpenRouter.")
-            logging.info(f"Unexpected response format from OpenRouter: {usage_data}")
-    else:
-        print(f"Error getting usage from OpenRouter: {usage_data['error']}")
-        logging.info(f"Error getting usage from OpenRouter: {usage_data['error']}")
+            print(f"Error getting usage from OpenRouter: {usage_data['error']}")
+            logging.info(f"Error getting usage from OpenRouter: {usage_data['error']}")
 
     # Keep the temporary file
     print(f"\nTemporary file kept at: {temp_path}")
@@ -339,6 +447,16 @@ def main():
         choices=['rewrite', 'light-plus'],
         default='rewrite',
         help='Processing mode: rewrite keeps the original behavior; light-plus uses slides mainly to correct and lightly refine the transcript.'
+    )
+    parser.add_argument(
+        '--provider',
+        choices=['openrouter', 'codex-notes', 'passthrough'],
+        default='openrouter',
+        help='openrouter keeps the original API path; codex-notes reads Codex-authored notes; passthrough only cleans speaker labels.'
+    )
+    parser.add_argument(
+        '--codex-notes-dir',
+        help='Directory of Codex-authored slide notes for --provider codex-notes.'
     )
     parser.add_argument('--no-review', action='store_true', help='Skip the manual segment-review step (for batch / non-interactive runs).')
     parser.add_argument('-w', '--word', action='store_true', help='Convert the output Markdown to Word document')
@@ -371,6 +489,8 @@ def main():
         num_threads=args.threads,
         mode=args.mode,
         no_review=args.no_review,
+        provider=args.provider,
+        codex_notes_dir=args.codex_notes_dir or "",
     )
 
     # Convert to Word if requested

@@ -2,8 +2,8 @@
 从演讲视频中抽取关键帧并生成带时间戳的 Markdown 索引。
 
 该脚本属于流程的第 02 步：
-1. 按固定时间间隔截取视频画面，保存到 `ppt_pics/`
-2. 基于帧间相似度检测幻灯片切换节点
+1. 按固定时间间隔读取视频画面，用低清灰度图做幻灯片变化检测
+2. 仅把检测出的幻灯片起始帧保存为高清图片到 `ppt_pics/`
 3. 生成 `ppt_timestamps.md`，记录每张幻灯片的时间戳与预览图
 
 Usage:
@@ -11,6 +11,7 @@ Usage:
         [--md_name MD_NAME] [-I | --interactive] [--rect_file PATH] [--force_reselect]
         [--ppt_rect x1,y1,x2,y2] [--full-frame] [--max_duration SEC]
         [--legacy_extract_all] [--ssim_max_side INT] [--output_max_side INT]
+        [--detect-width WIDTH] [--detection-backend hybrid-keyframe|accurate]
 
 Example (auto):
     python 02_extract_slide_timestamps.py data/inputs/GDB/media/GDB.mp4 -o data/outputs/GDB/GDB_frames
@@ -25,10 +26,13 @@ import cv2
 import os
 import json
 import argparse
+import re
+import shutil
+import subprocess
+import tempfile
 from skimage.metrics import structural_similarity as ssim
 import numpy as np
 import datetime
-import math
 import concurrent.futures  # Added for threading
 from typing import Dict, List, Optional, Tuple
 
@@ -689,7 +693,159 @@ def detect_mixed_layout(
     print("No mixed layout detected. Using full frame for extraction.")
     return layout
 
-def extract_frames(
+def _crop_to_ppt_region(frame: np.ndarray, layout_info=None) -> np.ndarray:
+    """Crop a video frame to the active PPT region when one is known."""
+    if layout_info and layout_info.get("ppt_rect"):
+        x, y, w, h = layout_info["ppt_rect"]
+        if w > 0 and h > 0:
+            x2 = min(x + w, frame.shape[1])
+            y2 = min(y + h, frame.shape[0])
+            x = max(0, min(x, frame.shape[1] - 1))
+            y = max(0, min(y, frame.shape[0] - 1))
+            if x < x2 and y < y2:
+                return frame[y:y2, x:x2].copy()
+            print("Warning: PPT crop rectangle invalid. Falling back to full frame.")
+        else:
+            print("Warning: PPT crop rectangle has non-positive dimensions. Falling back to full frame.")
+    return frame
+
+
+def _resize_for_detection(frame: np.ndarray, detect_width: int) -> np.ndarray:
+    """Convert a cropped frame to low-res grayscale for SSIM detection."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if detect_width <= 0 or gray.shape[1] <= detect_width:
+        return gray
+    detect_height = max(1, int(round(gray.shape[0] * (detect_width / gray.shape[1]))))
+    return cv2.resize(gray, (detect_width, detect_height), interpolation=cv2.INTER_AREA)
+
+
+def _image_extension(image_format: str) -> str:
+    return "jpg" if image_format in {"jpg", "jpeg"} else image_format
+
+
+def _image_filename(time_sec: float, image_format: str) -> str:
+    timestamp_str_file = format_time(time_sec).replace(":", "_").replace(".", "_")
+    return f"frame_{timestamp_str_file}.{_image_extension(image_format)}"
+
+
+def _slide_info(output_dir: str, time_sec: float, image_format: str) -> dict:
+    img_filename = _image_filename(time_sec, image_format)
+    img_path = os.path.join(output_dir, "ppt_pics", img_filename)
+    return {
+        "time_sec": time_sec,
+        "path": img_path,
+        "filename": img_filename,
+        "relative_path": os.path.join("ppt_pics", img_filename),
+    }
+
+
+def extract_detection_frames_ffmpeg(
+    video_path,
+    output_dir,
+    interval_sec,
+    layout_info,
+    max_duration_sec: float = None,
+    detect_width: int = 480,
+    image_format: str = "png",
+):
+    """Fast low-res detection extraction through ffmpeg rawvideo pipe.
+
+    This path is used only when the PPT crop is static. It lets ffmpeg sample,
+    crop, scale, and gray-convert frames in C, avoiding Python-level frame
+    skipping and OpenCV random/forward decode overhead.
+    """
+    if shutil.which("ffmpeg") is None:
+        return None
+    if not layout_info or not layout_info.get("ppt_rect"):
+        return None
+    if interval_sec <= 0 or detect_width <= 0:
+        return None
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration_sec = total_frames / fps if fps > 0 else 0
+    cap.release()
+
+    if max_duration_sec is not None and max_duration_sec > 0:
+        duration_sec = min(duration_sec, max_duration_sec)
+
+    x, y, w, h = layout_info["ppt_rect"]
+    if w <= 0 or h <= 0:
+        return None
+
+    detect_height = max(1, int(round(h * (detect_width / float(w)))))
+    sample_fps = 1.0 / float(interval_sec)
+    vf = f"fps=fps={sample_fps:.8f},crop={w}:{h}:{x}:{y},scale={detect_width}:{detect_height},format=gray"
+
+    os.makedirs(output_dir, exist_ok=True)
+    pics_dir = os.path.join(output_dir, "ppt_pics")
+    os.makedirs(pics_dir, exist_ok=True)
+
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        video_path,
+    ]
+    if duration_sec > 0:
+        cmd.extend(["-t", f"{duration_sec:.6f}"])
+    cmd.extend(["-an", "-sn", "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+
+    print(
+        f"Detecting slide changes with ffmpeg low-res pipe every {interval_sec} seconds "
+        f"(width={detect_width}, crop={layout_info['ppt_rect']})..."
+    )
+    print(f"Video Info: FPS={fps:.2f}, Total Frames={total_frames}, Duration={format_time(duration_sec)}")
+
+    frame_size = detect_width * detect_height
+    detection_frames = []
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout is not None
+    frame_index = 0
+    try:
+        while True:
+            buf = proc.stdout.read(frame_size)
+            if not buf:
+                break
+            if len(buf) != frame_size:
+                print(f"Warning: ffmpeg returned a partial detection frame ({len(buf)}/{frame_size} bytes).")
+                break
+            current_time_sec = frame_index * interval_sec
+            if duration_sec > 0 and current_time_sec > duration_sec + 1e-6:
+                break
+            info = _slide_info(output_dir, current_time_sec, image_format)
+            detect_gray = np.frombuffer(buf, dtype=np.uint8).reshape((detect_height, detect_width)).copy()
+            detection_frames.append(
+                {
+                    **info,
+                    "detect_gray": detect_gray,
+                }
+            )
+            frame_index += 1
+            if frame_index % 100 == 0:
+                print(f"  Prepared detection frame at {format_time(current_time_sec)}")
+    finally:
+        proc.stdout.close()
+
+    stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr is not None else ""
+    return_code = proc.wait()
+    if return_code != 0:
+        print(f"Warning: ffmpeg detection pipe failed with code {return_code}. Falling back to OpenCV.")
+        if stderr.strip():
+            print(stderr.strip()[:2000])
+        return None
+
+    print(f"Finished preparing {len(detection_frames)} low-res detection frames via ffmpeg.")
+    return detection_frames
+
+
+def extract_detection_frames(
     video_path,
     output_dir,
     interval_sec,
@@ -697,23 +853,36 @@ def extract_frames(
     dynamic_layout: bool = True,
     layout_refresh_interval: float = 10.0,
     max_duration_sec: float = None,
+    detect_width: int = 480,
+    image_format: str = "png",
 ):
-    """Extracts frames from video at specified intervals.
+    """Extract low-res in-memory frames for slide-change detection only.
 
-    When layout_info indicates mixed content, frames are cropped to the PPT region before saving.
+    This is the fast first stage: it samples the configured timestamps, crops
+    to the PPT region, downsizes to grayscale, and keeps the comparison image
+    in memory instead of writing every sampled frame as PNG.
     """
-    print(f"Extracting frames from '{video_path}' every {interval_sec} seconds...")
+    if not dynamic_layout:
+        ffmpeg_frames = extract_detection_frames_ffmpeg(
+            video_path,
+            output_dir,
+            interval_sec,
+            layout_info,
+            max_duration_sec=max_duration_sec,
+            detect_width=detect_width,
+            image_format=image_format,
+        )
+        if ffmpeg_frames is not None:
+            return ffmpeg_frames
 
-    # Create main output directory if it doesn't exist
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        print(f"Created directory: {output_dir}")
+    print(
+        f"Detecting slide changes from '{video_path}' every {interval_sec} seconds "
+        f"using low-res width={detect_width}..."
+    )
 
-    # Create ppt_pics subdirectory for images
+    os.makedirs(output_dir, exist_ok=True)
     pics_dir = os.path.join(output_dir, "ppt_pics")
-    if not os.path.exists(pics_dir):
-        os.makedirs(pics_dir)
-        print(f"Created images directory: {pics_dir}")
+    os.makedirs(pics_dir, exist_ok=True)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -723,85 +892,448 @@ def extract_frames(
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration_sec = total_frames / fps if fps > 0 else 0
-    
-    # Limit duration if max_duration_sec is specified
+
     if max_duration_sec is not None and max_duration_sec > 0:
         duration_sec = min(duration_sec, max_duration_sec)
-        print(f"Limiting extraction to first {max_duration_sec} seconds ({format_time(max_duration_sec)})")
+        print(f"Limiting detection to first {max_duration_sec} seconds ({format_time(max_duration_sec)})")
 
     print(f"Video Info: FPS={fps:.2f}, Total Frames={total_frames}, Duration={format_time(duration_sec)}")
 
-    extracted_frames = []
+    sample_times: List[float] = []
     current_time_sec = 0.0
+    while current_time_sec <= duration_sec:
+        sample_times.append(current_time_sec)
+        current_time_sec += interval_sec
+        if interval_sec <= 0:
+            print("Error: Interval must be positive.")
+            break
+        if len(sample_times) > (duration_sec / interval_sec) * 2 and duration_sec > 0:
+            print("Warning: Prepared significantly more frame timestamps than expected. Stopping.")
+            break
 
+    detection_frames = []
     current_layout = layout_info
     last_layout_update_time = -1e9
+    current_frame_id = 0
 
-    while current_time_sec <= duration_sec:
-        frame_id = int(current_time_sec * fps)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+    for current_time_sec in sample_times:
+        target_frame_id = int(current_time_sec * fps)
+
+        if target_frame_id < current_frame_id:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_id)
+            current_frame_id = target_frame_id
+
+        while current_frame_id < target_frame_id:
+            if not cap.grab():
+                break
+            current_frame_id += 1
+
         ret, frame = cap.read()
+        current_frame_id += 1
 
         if not ret:
-            # Might happen at the very end or if seeking fails
             print(f"Warning: Could not read frame at {format_time(current_time_sec)}")
-            current_time_sec += interval_sec
             continue
 
-        timestamp_str_file = format_time(current_time_sec).replace(":", "_").replace(".", "_")
-        img_filename = f"frame_{timestamp_str_file}.png"
-
-        # Save to ppt_pics subdirectory
-        pics_dir = os.path.join(output_dir, "ppt_pics")
-        img_path = os.path.join(pics_dir, img_filename)
-
-        # 根据需要动态更新 PPT 区域：场景切换时自动调整截图区域
         if dynamic_layout and (current_layout is None or current_time_sec - last_layout_update_time >= layout_refresh_interval):
             current_layout = _detect_ppt_rect_in_single_frame(frame)
             last_layout_update_time = current_time_sec
             print(f"[Dynamic layout] t={format_time(current_time_sec)} PPT rect={current_layout.get('ppt_rect')}")
 
-        frame_to_save = frame
         active_layout = current_layout if dynamic_layout else layout_info
+        cropped = _crop_to_ppt_region(frame, active_layout)
+        detect_gray = _resize_for_detection(cropped, detect_width)
 
-        if active_layout and active_layout.get("ppt_rect"):
-            x, y, w, h = active_layout["ppt_rect"]
-            if w > 0 and h > 0:
-                x2 = min(x + w, frame.shape[1])
-                y2 = min(y + h, frame.shape[0])
-                x = max(0, min(x, frame.shape[1] - 1))
-                y = max(0, min(y, frame.shape[0] - 1))
-                if x < x2 and y < y2:
-                    frame_to_save = frame[y:y2, x:x2].copy()
-                else:
-                    print("Warning: PPT crop rectangle invalid. Falling back to full frame.")
-            else:
-                print("Warning: PPT crop rectangle has non-positive dimensions. Falling back to full frame.")
+        info = _slide_info(output_dir, current_time_sec, image_format)
+        detection_frames.append(
+            {
+                **info,
+                "detect_gray": detect_gray,
+            }
+        )
 
-        cv2.imwrite(img_path, frame_to_save)
-
-        # Store the relative path for markdown (ppt_pics/filename.png)
-        relative_path = os.path.join("ppt_pics", img_filename)
-        extracted_frames.append({'time_sec': current_time_sec, 'path': img_path, 'filename': img_filename, 'relative_path': relative_path})
-
-        # Print progress sparsely
-        if len(extracted_frames) % 20 == 0:
-             print(f"  Extracted frame at {format_time(current_time_sec)}")
-
-
-        current_time_sec += interval_sec
-        # Small safety break for potential infinite loops with faulty videos
-        if interval_sec <= 0:
-             print("Error: Interval must be positive.")
-             break
-        if len(extracted_frames) > (duration_sec / interval_sec) * 2 and duration_sec > 0: # Heuristic check
-            print("Warning: Extracted significantly more frames than expected. Stopping.")
-            break
-
+        if len(detection_frames) % 100 == 0:
+            print(f"  Prepared detection frame at {format_time(current_time_sec)}")
 
     cap.release()
-    print(f"Finished extracting {len(extracted_frames)} frames.")
-    return extracted_frames
+    print(f"Finished preparing {len(detection_frames)} low-res detection frames.")
+    return detection_frames
+
+
+def _video_duration(video_path: str, max_duration_sec: float = None) -> float:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return max_duration_sec or 0.0
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    duration_sec = total_frames / fps if fps > 0 else 0.0
+    if max_duration_sec is not None and max_duration_sec > 0:
+        return min(duration_sec, max_duration_sec)
+    return duration_sec
+
+
+def extract_keyframe_detection_frames_ffmpeg(
+    video_path,
+    output_dir,
+    layout_info,
+    max_duration_sec: float = None,
+    detect_width: int = 240,
+    image_format: str = "png",
+):
+    """Read low-res keyframes and their timestamps in one ffmpeg pass."""
+    if shutil.which("ffmpeg") is None:
+        return None
+    if not layout_info or not layout_info.get("ppt_rect"):
+        return None
+    if detect_width <= 0:
+        return None
+
+    x, y, w, h = layout_info["ppt_rect"]
+    if w <= 0 or h <= 0:
+        return None
+
+    detect_height = max(1, int(round(h * (detect_width / float(w)))))
+    frame_size = detect_width * detect_height
+    vf = f"crop={w}:{h}:{x}:{y},scale={detect_width}:{detect_height},format=gray,showinfo"
+
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-skip_frame",
+        "nokey",
+        "-i",
+        video_path,
+    ]
+    if max_duration_sec is not None and max_duration_sec > 0:
+        cmd.extend(["-t", f"{max_duration_sec:.6f}"])
+    cmd.extend(["-an", "-sn", "-vf", vf, "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+
+    print(
+        f"Detecting keyframe slide candidates with ffmpeg keyframe scan "
+        f"(width={detect_width}, crop={layout_info['ppt_rect']})..."
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "ppt_pics"), exist_ok=True)
+    showinfo_re = re.compile(r"n:\s*(\d+).*?pts_time:([0-9.]+|N/A)")
+    frames = []
+
+    with tempfile.NamedTemporaryFile("wb", prefix="keyframe-showinfo-", suffix=".log", delete=False) as stderr_file:
+        stderr_path = stderr_file.name
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr_file)
+        assert proc.stdout is not None
+        try:
+            while True:
+                buf = proc.stdout.read(frame_size)
+                if not buf:
+                    break
+                if len(buf) != frame_size:
+                    print(f"Warning: ffmpeg returned a partial keyframe ({len(buf)}/{frame_size} bytes).")
+                    break
+                frames.append(np.frombuffer(buf, dtype=np.uint8).reshape((detect_height, detect_width)).copy())
+        finally:
+            proc.stdout.close()
+        return_code = proc.wait()
+
+    stderr = ""
+    try:
+        with open(stderr_path, "r", encoding="utf-8", errors="replace") as f:
+            stderr = f.read()
+    finally:
+        try:
+            os.unlink(stderr_path)
+        except OSError:
+            pass
+
+    if return_code != 0:
+        print(f"Warning: ffmpeg keyframe scan failed with code {return_code}.")
+        if stderr.strip():
+            print(stderr.strip()[-2000:])
+        return None
+
+    indexed_times = {}
+    for match in showinfo_re.finditer(stderr):
+        index = int(match.group(1))
+        value = match.group(2)
+        if value != "N/A":
+            indexed_times[index] = float(value)
+
+    detection_frames = []
+    for index, detect_gray in enumerate(frames):
+        if index not in indexed_times:
+            continue
+        time_sec = indexed_times[index]
+        info = _slide_info(output_dir, time_sec, image_format)
+        detection_frames.append({**info, "detect_gray": detect_gray})
+
+    print(f"Finished preparing {len(detection_frames)} low-res keyframes via ffmpeg.")
+    return detection_frames
+
+
+def _cluster_times(times: List[float], gap_sec: float = 12.0) -> List[List[float]]:
+    clusters: List[List[float]] = []
+    for time_sec in sorted(times):
+        if not clusters or time_sec - clusters[-1][-1] > gap_sec:
+            clusters.append([time_sec])
+        else:
+            clusters[-1].append(time_sec)
+    return clusters
+
+
+def _snap_to_interval(time_sec: float, interval_sec: float, duration_sec: float) -> float:
+    snapped = round(time_sec / interval_sec) * interval_sec
+    return max(0.0, min(duration_sec, snapped))
+
+
+def _merge_windows(windows: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    if not windows:
+        return []
+    windows = sorted(windows)
+    merged: List[List[float]] = []
+    for start, end in windows:
+        if not merged or start > merged[-1][1] + 1e-6:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return [(start, end) for start, end in merged]
+
+
+def extract_detection_window_ffmpeg(
+    video_path,
+    window: Tuple[float, float],
+    interval_sec: float,
+    layout_info,
+    detect_width: int,
+):
+    start, end = window
+    if end <= start:
+        return []
+    x, y, w, h = layout_info["ppt_rect"]
+    detect_height = max(1, int(round(h * (detect_width / float(w)))))
+    frame_size = detect_width * detect_height
+    vf = f"fps=fps={1.0 / interval_sec:.8f},crop={w}:{h}:{x}:{y},scale={detect_width}:{detect_height},format=gray"
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{start:.6f}",
+        "-t",
+        f"{(end - start):.6f}",
+        "-i",
+        video_path,
+        "-an",
+        "-sn",
+        "-vf",
+        vf,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "-",
+    ]
+
+    frames = []
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout is not None
+    index = 0
+    try:
+        while True:
+            buf = proc.stdout.read(frame_size)
+            if not buf:
+                break
+            if len(buf) != frame_size:
+                print(f"Warning: ffmpeg returned a partial local detection frame ({len(buf)}/{frame_size} bytes).")
+                break
+            frames.append(
+                {
+                    "time_sec": start + index * interval_sec,
+                    "detect_gray": np.frombuffer(buf, dtype=np.uint8).reshape((detect_height, detect_width)).copy(),
+                }
+            )
+            index += 1
+    finally:
+        proc.stdout.close()
+
+    stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr is not None else ""
+    return_code = proc.wait()
+    if return_code != 0:
+        print(f"Warning: ffmpeg local refine window failed with code {return_code}: {window}")
+        if stderr.strip():
+            print(stderr.strip()[-1000:])
+        return []
+    return frames
+
+
+def hybrid_keyframe_slide_changes(
+    video_path,
+    output_dir,
+    interval_sec,
+    threshold,
+    layout_info,
+    max_duration_sec: float = None,
+    detect_width: int = 240,
+    image_format: str = "png",
+    refine_workers: int = 6,
+):
+    """Fast default: keyframe recall plus local accurate refinement."""
+    if interval_sec <= 0:
+        return None
+    if not layout_info or not layout_info.get("ppt_rect"):
+        return None
+
+    duration_sec = _video_duration(video_path, max_duration_sec=max_duration_sec)
+    if duration_sec <= 0:
+        return None
+
+    keyframes = extract_keyframe_detection_frames_ffmpeg(
+        video_path,
+        output_dir,
+        layout_info,
+        max_duration_sec=max_duration_sec,
+        detect_width=detect_width,
+        image_format=image_format,
+    )
+    if not keyframes or len(keyframes) < 2:
+        return None
+
+    keyframe_changes = find_slide_changes(keyframes, threshold=threshold)
+    candidate_times = sorted({float(item["time_sec"]) for item in keyframe_changes})
+    clusters = _cluster_times(candidate_times)
+
+    accepted_times = {0.0}
+    windows: List[Tuple[float, float]] = []
+    for cluster in clusters:
+        if len(cluster) == 1:
+            accepted_times.add(_snap_to_interval(cluster[0], interval_sec, duration_sec))
+            continue
+        start = max(0.0, np.floor((cluster[0] - 2 * interval_sec) / interval_sec) * interval_sec)
+        end = min(duration_sec, np.ceil((cluster[-1] + 3 * interval_sec) / interval_sec) * interval_sec)
+        windows.append((float(start), float(end)))
+
+    # Validate the tail; screen recordings often end with a final state change.
+    tail_start = max(0.0, np.floor((duration_sec - 4 * interval_sec) / interval_sec) * interval_sec)
+    windows.append((float(tail_start), duration_sec))
+    windows = _merge_windows(windows)
+
+    print(
+        f"Hybrid keyframe mode: {len(candidate_times)} keyframe candidates, "
+        f"{len(windows)} local refine windows."
+    )
+
+    frames_by_time: Dict[float, np.ndarray] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, refine_workers)) as executor:
+        futures = [
+            executor.submit(
+                extract_detection_window_ffmpeg,
+                video_path,
+                window,
+                interval_sec,
+                layout_info,
+                detect_width,
+            )
+            for window in windows
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            for frame in future.result():
+                frames_by_time[round(float(frame["time_sec"]), 3)] = frame["detect_gray"]
+
+    local_times = sorted(frames_by_time)
+    for prev_t, curr_t in zip(local_times, local_times[1:]):
+        if abs((curr_t - prev_t) - interval_sec) > 1e-3:
+            continue
+        prev = frames_by_time[prev_t]
+        curr = frames_by_time[curr_t]
+        data_range = max(int(prev.max()) - int(prev.min()), 1)
+        if ssim(prev, curr, data_range=data_range) < threshold:
+            accepted_times.add(curr_t)
+
+    slide_changes = []
+    for time_sec in sorted(t for t in accepted_times if 0 <= t <= duration_sec + 1e-6):
+        slide_changes.append(_slide_info(output_dir, time_sec, image_format))
+
+    print(f"Hybrid keyframe mode found {len(slide_changes)} refined slide starts.")
+    return slide_changes
+
+
+def materialize_slide_frames(
+    video_path,
+    slide_changes,
+    layout_info=None,
+    dynamic_layout: bool = True,
+    image_format: str = "png",
+    jpeg_quality: int = 85,
+    workers: int = 6,
+):
+    """Save high-resolution images only for frames identified as slide starts."""
+    print(f"Materializing {len(slide_changes)} high-resolution slide frames as {image_format}...")
+    if not slide_changes:
+        return []
+
+    def _write_slide(slide):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"Error: Could not open video file {video_path}")
+            return None
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_id = int(slide["time_sec"] * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            print(f"Warning: Could not read selected slide frame at {format_time(slide['time_sec'])}")
+            return None
+
+        active_layout = _detect_ppt_rect_in_single_frame(frame) if dynamic_layout else layout_info
+        frame_to_save = _crop_to_ppt_region(frame, active_layout)
+        os.makedirs(os.path.dirname(slide["path"]), exist_ok=True)
+        write_args = []
+        if image_format in {"jpg", "jpeg"}:
+            write_args = [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
+        elif image_format == "webp":
+            write_args = [int(cv2.IMWRITE_WEBP_QUALITY), int(jpeg_quality)]
+        cv2.imwrite(slide["path"], frame_to_save, write_args)
+        slide.pop("detect_gray", None)
+        return slide
+
+    saved = []
+    if dynamic_layout or workers <= 1:
+        for index, slide in enumerate(slide_changes, start=1):
+            written = _write_slide(slide)
+            if written:
+                saved.append(written)
+            if index % 20 == 0:
+                print(f"  Materialized {index}/{len(slide_changes)} slide frames...")
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_write_slide, slide) for slide in slide_changes]
+            for index, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+                written = future.result()
+                if written:
+                    saved.append(written)
+                if index % 20 == 0:
+                    print(f"  Materialized {index}/{len(slide_changes)} slide frames...")
+        saved.sort(key=lambda item: item["time_sec"])
+
+    print(f"Finished materializing {len(saved)} slide frames.")
+    return saved
+
+
+def _gray_for_comparison(frame_info):
+    if "detect_gray" in frame_info:
+        return frame_info["detect_gray"]
+
+    img = cv2.imread(frame_info["path"])
+    if img is None:
+        return None
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
 
 def _make_frame_info(output_dir: str, current_time_sec: float) -> Dict[str, object]:
     timestamp_str_file = format_time(current_time_sec).replace(":", "_").replace(".", "_")
@@ -1123,16 +1655,12 @@ def _find_slide_changes_mps(frame_list, threshold=0.9, max_side=512, backend="au
 def compare_frame_pair(prev_frame_info, current_frame_info, threshold, index):
     """Helper function to compare a single pair of frames for SSIM."""
     try:
-        # Use the full path to read the images
-        prev_img = cv2.imread(prev_frame_info['path'])
-        curr_img = cv2.imread(current_frame_info['path'])
+        prev_img_gray = _gray_for_comparison(prev_frame_info)
+        curr_img_gray = _gray_for_comparison(current_frame_info)
 
-        if prev_img is None or curr_img is None:
-            print(f"Warning: Could not read image for comparison: {prev_frame_info['path'] if prev_img is None else ''} {current_frame_info['path'] if curr_img is None else ''}")
+        if prev_img_gray is None or curr_img_gray is None:
+            print(f"Warning: Could not read image for comparison: {prev_frame_info['path'] if prev_img_gray is None else ''} {current_frame_info['path'] if curr_img_gray is None else ''}")
             return None # Cannot compare if images are missing
-
-        prev_img_gray = cv2.cvtColor(prev_img, cv2.COLOR_BGR2GRAY)
-        curr_img_gray = cv2.cvtColor(curr_img, cv2.COLOR_BGR2GRAY)
 
         if prev_img_gray.shape != curr_img_gray.shape:
             print(f"Warning: Frame dimensions mismatch between {prev_frame_info['path']} and {current_frame_info['path']}. Skipping comparison.")
@@ -1141,7 +1669,8 @@ def compare_frame_pair(prev_frame_info, current_frame_info, threshold, index):
             return None
 
         # Calculate SSIM
-        similarity_index = ssim(prev_img_gray, curr_img_gray, data_range=prev_img_gray.max() - prev_img_gray.min())
+        data_range = max(int(prev_img_gray.max()) - int(prev_img_gray.min()), 1)
+        similarity_index = ssim(prev_img_gray, curr_img_gray, data_range=data_range)
 
         # print(f"  Compared {prev_frame_info['filename']} and {current_frame_info['filename']} (Index {index}): SSIM = {similarity_index:.4f}")
 
@@ -1268,6 +1797,36 @@ def main():
         help="Streaming mode: resize saved slide screenshots so their longest side is at most this many pixels; set 0 to keep original resolution (default: 0).",
     )
     parser.add_argument("--md_name", help="Name for the output markdown file (default: same as output directory name with .md extension).")
+    parser.add_argument(
+        "--detect-width",
+        type=int,
+        default=240,
+        help="Low-res grayscale width used for slide-change detection (default: 240).",
+    )
+    parser.add_argument(
+        "--detection-backend",
+        choices=["hybrid-keyframe", "accurate"],
+        default="hybrid-keyframe",
+        help="Slide detection backend. hybrid-keyframe is the fast default; accurate scans the full video at --interval.",
+    )
+    parser.add_argument(
+        "--image-format",
+        choices=["jpg", "jpeg", "png", "webp"],
+        default="png",
+        help="Image format for materialized slide frames (default: png).",
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=85,
+        help="JPEG/WebP quality when --image-format is jpg/jpeg/webp (default: 85).",
+    )
+    parser.add_argument(
+        "--materialize-workers",
+        type=int,
+        default=6,
+        help="Parallel workers for writing selected slide images when layout is static (default: 6).",
+    )
     parser.add_argument(
         "--ppt_rect",
         help="Manual PPT crop rect in relative coordinates 'x1,y1,x2,y2' (each in [0,1]). "
@@ -1434,6 +1993,43 @@ def main():
         else:
             print("No frames were extracted. Cannot proceed.")
             return
+    elif args.detection_backend == "hybrid-keyframe" and not use_dynamic:
+        slide_changes = hybrid_keyframe_slide_changes(
+            args.video_file,
+            args.output_dir,
+            args.interval,
+            args.threshold,
+            layout_info,
+            max_duration_sec=args.max_duration,
+            detect_width=args.detect_width,
+            image_format=args.image_format,
+            refine_workers=args.materialize_workers,
+        )
+        if slide_changes is None:
+            print("Hybrid keyframe mode unavailable; falling back to accurate full scan.")
+
+        if slide_changes is not None:
+            slide_changes = materialize_slide_frames(
+                args.video_file,
+                slide_changes,
+                layout_info=layout_info,
+                dynamic_layout=False,
+                image_format=args.image_format,
+                jpeg_quality=args.jpeg_quality,
+                workers=args.materialize_workers,
+            )
+        else:
+            slide_changes = extract_slide_changes_streaming(
+                args.video_file,
+                args.output_dir,
+                args.interval,
+                args.threshold,
+                layout_info=layout_info,
+                dynamic_layout=use_dynamic,
+                max_duration_sec=args.max_duration,
+                ssim_max_side=args.ssim_max_side,
+                output_max_side=args.output_max_side,
+            )
     else:
         slide_changes = extract_slide_changes_streaming(
             args.video_file,

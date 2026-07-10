@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import mimetypes
 import re
 import shutil
 import subprocess
@@ -14,6 +16,7 @@ from urllib.parse import unquote
 
 SCRIPT_PATH = Path(__file__).resolve()
 SCRIPT_DIR = SCRIPT_PATH.parent
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
 def run(cmd: list[str], cwd: Path = SCRIPT_DIR) -> None:
@@ -78,25 +81,25 @@ def remove_processor_prompts(markdown_path: Path) -> None:
 
 def rewrite_md_links(markdown_path: Path, image_dir_name: str) -> None:
     text = markdown_path.read_text(encoding="utf-8")
-    text = text.replace("(ppt_pics/", f"(<{image_dir_name}/")
 
-    # If the source already had unwrapped rewritten links, make sure image links
-    # are angle-wrapped so spaces and parentheses in folder names are safe.
+    def replace_target(match: re.Match[str]) -> str:
+        alt = match.group(1)
+        raw_target = match.group(2).strip()
+        target = raw_target[1:-1] if raw_target.startswith("<") and raw_target.endswith(">") else raw_target
+        if target.startswith("ppt_pics/"):
+            target = f"{image_dir_name}/{Path(target).name}"
+        return f"![{alt}](<{target}>)"
+
     lines = text.splitlines(keepends=True)
     new_lines: list[str] = []
     for line in lines:
-        if line.lstrip().startswith("![") and "](" in line and ".png" in line:
-            start = line.find("](")
-            end = line.rfind(")")
-            if start != -1 and end != -1:
-                target = line[start + 2 : end]
-                if target.endswith(".png") and not (target.startswith("<") and target.endswith(">")):
-                    line = line[: start + 2] + "<" + target + ">" + line[end:]
+        if line.lstrip().startswith("![") and "](" in line and any(ext in line.lower() for ext in IMAGE_EXTENSIONS):
+            line = re.sub(r"!\[([^\]]*)\]\((<[^>]+>|[^)]+)\)", replace_target, line)
         new_lines.append(line)
     markdown_path.write_text("".join(new_lines), encoding="utf-8")
 
 
-def referenced_png_names(markdown_path: Path, image_dir_name: str) -> set[str]:
+def referenced_image_names(markdown_path: Path, image_dir_name: str) -> set[str]:
     text = markdown_path.read_text(encoding="utf-8")
     pattern = re.compile(r"!\[[^\]]*\]\((<[^>]+>|[^)]+)\)")
     refs: set[str] = set()
@@ -108,14 +111,16 @@ def referenced_png_names(markdown_path: Path, image_dir_name: str) -> set[str]:
     return refs
 
 
-def remove_unreferenced_pngs(image_dir: Path, keep_names: set[str]) -> tuple[int, int]:
+def remove_unreferenced_images(image_dir: Path, keep_names: set[str]) -> tuple[int, int]:
     kept = 0
     deleted = 0
-    for png in image_dir.glob("*.png"):
-        if png.name in keep_names:
+    for image in image_dir.iterdir():
+        if not image.is_file() or image.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        if image.name in keep_names:
             kept += 1
         else:
-            png.unlink()
+            image.unlink()
             deleted += 1
     return kept, deleted
 
@@ -136,6 +141,33 @@ def verify_html_refs(share_dir: Path) -> tuple[int, list[tuple[str, str]]]:
     return checked, missing
 
 
+def embed_html_images(html_path: Path) -> tuple[int, list[str]]:
+    """Inline local image refs so the HTML can be opened as a single file."""
+    text = html_path.read_text(encoding="utf-8")
+    base_dir = html_path.parent
+    missing: list[str] = []
+    embedded = 0
+
+    def replace_src(match: re.Match[str]) -> str:
+        nonlocal embedded
+        quote = match.group(1)
+        src = match.group(2)
+        if src.startswith(("http://", "https://", "data:")):
+            return match.group(0)
+        image_path = (base_dir / unquote(src)).resolve()
+        if not image_path.is_file():
+            missing.append(src)
+            return match.group(0)
+        mime_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
+        data = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        embedded += 1
+        return f'src={quote}data:{mime_type};base64,{data}{quote}'
+
+    text = re.sub(r'src=(["\'])([^"\']+\.(?:png|jpe?g|webp|gif))\1', replace_src, text, flags=re.I)
+    html_path.write_text(text, encoding="utf-8")
+    return embedded, missing
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate a shareable HTML article from one video.")
     parser.add_argument("video", type=Path)
@@ -153,15 +185,55 @@ def main() -> None:
         "--output-max-side",
         type=int,
         default=0,
-        help="Step 02 streaming mode: resize saved screenshots to this longest side; 0 keeps original resolution.",
+        help="Step 02 accurate streaming mode: resize saved screenshots to this longest side; 0 keeps original resolution.",
     )
     parser.add_argument(
         "--legacy-extract-all",
         action="store_true",
         help="Step 02: save every sampled PNG before SSIM comparison instead of the faster streaming mode.",
     )
+    parser.add_argument(
+        "--detect-width",
+        type=int,
+        default=240,
+        help="Low-res detection width passed to 02_extract_slide_timestamps.py.",
+    )
+    parser.add_argument(
+        "--detection-backend",
+        choices=["hybrid-keyframe", "accurate"],
+        default="hybrid-keyframe",
+        help="Slide detection backend passed to 02_extract_slide_timestamps.py.",
+    )
+    parser.add_argument(
+        "--image-format",
+        choices=["jpg", "jpeg", "png", "webp"],
+        default="png",
+        help="Slide image format passed to 02_extract_slide_timestamps.py.",
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=85,
+        help="JPEG/WebP quality passed to 02_extract_slide_timestamps.py.",
+    )
     parser.add_argument("--threads", type=int, default=4, help="Threads for 04_polish_slide_transcript segments.")
+    parser.add_argument(
+        "--polish-provider",
+        choices=["openrouter", "codex-notes", "passthrough"],
+        default="openrouter",
+        help="openrouter keeps the original LLM flow; codex-notes reads Codex-authored notes; passthrough keeps aligned transcript text.",
+    )
+    parser.add_argument(
+        "--codex-notes-dir",
+        type=Path,
+        help="Directory containing Codex notes for --polish-provider codex-notes.",
+    )
     parser.add_argument("--compress-png", action="store_true", help="Compress referenced PNGs in the share folder.")
+    parser.add_argument(
+        "--embed-html-images",
+        action="store_true",
+        help="Inline local images into the generated HTML for robust single-file preview/sharing.",
+    )
     parser.add_argument("--zip", action="store_true", help="Create a zip archive of the share folder.")
     args = parser.parse_args()
 
@@ -199,6 +271,14 @@ def main() -> None:
         slides_md.name,
         "--output_max_side",
         str(args.output_max_side),
+        "--detect-width",
+        str(args.detect_width),
+        "--detection-backend",
+        args.detection_backend,
+        "--image-format",
+        args.image_format,
+        "--jpeg-quality",
+        str(args.jpeg_quality),
     ]
     if args.interactive:
         cmd02.append("--interactive")
@@ -222,20 +302,23 @@ def main() -> None:
     )
 
     processed_md = work_dir / f"{stem}_integrated_Processed.md"
-    run(
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "04_polish_slide_transcript.py"),
-            str(integrated_md),
-            str(processed_md),
-            "-y",
-            "--no-review",
-            "--mode",
-            "light-plus",
-            "-t",
-            str(args.threads),
-        ]
-    )
+    cmd04 = [
+        sys.executable,
+        str(SCRIPT_DIR / "04_polish_slide_transcript.py"),
+        str(integrated_md),
+        str(processed_md),
+        "-y",
+        "--no-review",
+        "--mode",
+        "light-plus",
+        "--provider",
+        args.polish_provider,
+        "-t",
+        str(args.threads),
+    ]
+    if args.codex_notes_dir:
+        cmd04.extend(["--codex-notes-dir", str(args.codex_notes_dir.resolve())])
+    run(cmd04)
     remove_processor_prompts(processed_md)
 
     final_md = share_dir / f"{stem}.md"
@@ -245,13 +328,22 @@ def main() -> None:
     shutil.copytree(work_dir / "ppt_pics", final_image_dir)
     rewrite_md_links(final_md, image_dir_name)
 
-    keep = referenced_png_names(final_md, image_dir_name)
-    kept, deleted = remove_unreferenced_pngs(final_image_dir, keep)
-    print(f"Referenced PNGs kept: {kept}; unreferenced PNGs deleted: {deleted}")
+    keep = referenced_image_names(final_md, image_dir_name)
+    kept, deleted = remove_unreferenced_images(final_image_dir, keep)
+    print(f"Referenced images kept: {kept}; unreferenced images deleted: {deleted}")
 
     html_path = share_dir / f"{stem}.html"
     run(["pandoc", str(final_md), "-o", str(html_path), "--standalone", "--metadata", f"title={stem}"])
     patch_pc_width_html(html_path)
+
+    if args.embed_html_images:
+        embedded, missing_embed = embed_html_images(html_path)
+        if missing_embed:
+            print(f"Missing images while embedding: {len(missing_embed)}")
+            for src in missing_embed[:10]:
+                print(f"  {src}")
+            raise SystemExit(1)
+        print(f"Embedded HTML images: {embedded}")
 
     if args.compress_png:
         compressor = SCRIPT_DIR / "05_compress_png_images.py"
