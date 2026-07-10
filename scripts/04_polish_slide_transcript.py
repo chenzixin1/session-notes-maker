@@ -24,8 +24,17 @@ import concurrent.futures
 from threading import Lock
 import shutil
 import re
+import importlib.util
 
-import config
+try:
+    import config
+except ModuleNotFoundError:
+    config_path = os.path.join(os.path.dirname(__file__), "config.example.py")
+    config_spec = importlib.util.spec_from_file_location("config", config_path)
+    if config_spec is None or config_spec.loader is None:
+        raise
+    config = importlib.util.module_from_spec(config_spec)
+    config_spec.loader.exec_module(config)
 import markdown_llm_utils as utils
 
 def open_file_in_editor(file_path: str) -> None:
@@ -124,16 +133,25 @@ def _section_after_heading(text: str, heading_patterns: list[str]) -> str:
     return "\n".join(lines[start:end]).strip()
 
 
-def _find_codex_note(notes_dir: str, idx: int, image_path: str) -> str:
+def _segment_slide_number(segment: dict, fallback_idx: int) -> int:
+    """Resolve the visible slide number instead of relying on segment position."""
+    header = segment.get("header") or ""
+    match = re.search(r"\bslide\s+(\d+)\b", header, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return fallback_idx + 1
+
+
+def _find_codex_note(notes_dir: str, slide_number: int, image_path: str) -> str:
     """Find a Codex-authored note for one slide segment."""
     if not notes_dir:
         return ""
     image_stem = os.path.splitext(os.path.basename(image_path))[0]
     candidates = [
-        f"slide_{idx + 1:02d}.md",
-        f"slide_{idx + 1}.md",
-        f"{idx + 1:02d}_{image_stem}.md",
-        f"{idx + 1}_{image_stem}.md",
+        f"slide_{slide_number:02d}.md",
+        f"slide_{slide_number}.md",
+        f"{slide_number:02d}_{image_stem}.md",
+        f"{slide_number}_{image_stem}.md",
         f"{image_stem}.md",
     ]
     for name in candidates:
@@ -146,7 +164,8 @@ def _find_codex_note(notes_dir: str, idx: int, image_path: str) -> str:
 
 def _apply_codex_note(idx: int, segment: dict, image_path: str, notes_dir: str) -> dict:
     """Use Codex-authored notes to build a processed segment without OpenRouter."""
-    note = _find_codex_note(notes_dir, idx, image_path)
+    slide_number = _segment_slide_number(segment, idx)
+    note = _find_codex_note(notes_dir, slide_number, image_path)
     cleaned_transcript = _strip_speaker_labels(segment["text"])
     if not note:
         return {

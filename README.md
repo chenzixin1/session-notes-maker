@@ -309,6 +309,10 @@ scripts/markdown_llm_utils.py
 - 不做大幅重写；
 - 最终 HTML 不包含 prompt 附录。
 
+在 Codex 中可使用 `scripts/05_prepare_codex_batches.py` 把逐页输入拆成互不重叠的批次，交给多个 sub-agent 并行生成 `codex_notes/slide_N.md`，再由 `--provider codex-notes` 汇总。这是 Codex 本地执行的 light-plus 路径，不依赖 OpenRouter。
+
+逐页校正完成后，使用 `scripts/06_merge_light_polish_scenes.py` 把每页 PPT 内的字幕碎片合并成一段完整讲稿。最终稿严格保持一页 PPT 对应一段讲稿，不跨页合并；正文使用自然段，不保留逐条 ASR 时间戳，时间只在 PPT 标题中保留整体范围。
+
 ---
 
 ## 7. 使用方法
