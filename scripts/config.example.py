@@ -36,7 +36,8 @@ TEMP_AUDIO_SUFFIX = "_temp"
 TRANSCRIPT_SUFFIX = "_transcript.txt"
 
 # [whisper]
-WHISPER_MODEL = "base"
+# Used automatically when VOLCENGINE_API_KEY is not configured.
+WHISPER_MODEL = "small"
 WHISPER_LANGUAGE = "zh"
 
 # [prompt - DocxOptimizer]
@@ -232,7 +233,7 @@ TRANSCRIPTION_USER_PROMPT = """Please transcribe the attached audio file accurat
 
 # Volcano Engine API Configuration
 
-# API key（新版控制台只需要这一项）
+# API key（可选；未配置时自动使用本地 Whisper）
 VOLCENGINE_API_KEY = "YOUR_VOLCENGINE_API_KEY"
 # 旧版控制台如需双字段鉴权，再填写 APP_KEY，并把 Access Token 填到 ACCESS_KEY。
 APP_KEY = ""

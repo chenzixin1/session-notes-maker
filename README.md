@@ -1,6 +1,6 @@
 # Session Notes Maker 使用文档
 
-![Session Notes Maker 项目概览：火山 ASR 转录视频，Codex sub-agent 并行校对和轻量打磨，只需配置 VOLCENGINE_API_KEY](assets/session-notes-maker-overview.png)
+![Session Notes Maker 项目概览：自动选择火山 ASR 或本地 Whisper 转录，Codex sub-agent 并行校对和轻量打磨](assets/session-notes-maker-overview.png)
 
 这个 Skill 用来把一段演讲、课程、会议或带 PPT 的视频，自动生成一份可分享的 HTML 图文稿。最终产物包含：
 
@@ -20,8 +20,12 @@
 
 ```mermaid
 flowchart TD
-    inputVideo["输入视频<br/>video.mp4"] --> transcribe["01 转录<br/>抽取音频并调用火山 ASR"]
-    transcribe --> transcript["转录稿<br/>video_transcript.txt"]
+    inputVideo["输入视频<br/>video.mp4"] --> extractAudio["01 抽取音频<br/>16kHz 单声道 MP3"]
+    extractAudio --> provider{"存在有效的<br/>VOLCENGINE_API_KEY？"}
+    provider -->|是| volcengine["火山 ASR Flash<br/>Base64 直接发送"]
+    provider -->|否| whisper["本地 Whisper<br/>默认 small 模型"]
+    volcengine --> transcript["统一转录稿<br/>video_transcript.txt"]
+    whisper --> transcript
 
     inputVideo --> slideDetect["02 截图与换页检测<br/>框选 PPT 区域并生成截图"]
     slideDetect --> slideMd["幻灯片时间戳 Markdown<br/>video.md"]
@@ -64,6 +68,7 @@ session-notes-maker/
     ├── 05_compress_png_images.py
     ├── config.example.py
     ├── requirements.txt
+    ├── requirements-whisper.txt
     └── .gitignore
 ```
 
@@ -115,6 +120,14 @@ pip install -r ~/.cursor/skills/session-notes-maker/scripts/requirements.txt
 - `Pillow`
 - `openai`
 
+如果希望在没有火山 Key 时自动使用本地 Whisper，再安装可选依赖：
+
+```bash
+pip install -r ~/.cursor/skills/session-notes-maker/scripts/requirements-whisper.txt
+```
+
+首次使用某个 Whisper 模型时会自动下载模型文件；默认使用兼顾速度与准确率的 `small`。
+
 ### 2.3 安装系统命令
 
 还需要以下命令行工具：
@@ -149,7 +162,7 @@ cp ~/.cursor/skills/session-notes-maker/scripts/config.example.py \
    ~/.cursor/skills/session-notes-maker/scripts/config.py
 ```
 
-然后只需填写 `scripts/config.py` 中的 `VOLCENGINE_API_KEY`。Codex sub-agent 使用当前 Codex 会话，不需要额外模型 API Key。
+`VOLCENGINE_API_KEY` 是可选项：配置有效 Key 时优先调用火山引擎；未配置时自动使用本地 Whisper。Codex sub-agent 使用当前 Codex 会话，不需要额外模型 API Key。
 
 注意：
 
@@ -161,7 +174,7 @@ cp ~/.cursor/skills/session-notes-maker/scripts/config.example.py \
 
 ## 4. 需要哪些模型和服务
 
-默认 Codex 路径只依赖一项外部服务：火山引擎语音识别。它负责把视频音频转成带时间戳的转录稿。
+默认 Codex 路径不强制依赖外部模型服务。转录脚本会自动选择后端：有有效的火山 Key 时使用火山引擎，未配置 Key 时使用本地 Whisper。
 
 图片理解、术语校对和 `light-plus` 轻量打磨由当前 Codex 会话中的多个 sub-agent 并行完成，不需要 OpenRouter，也不需要额外模型 API Key。
 
@@ -169,9 +182,17 @@ cp ~/.cursor/skills/session-notes-maker/scripts/config.example.py \
 
 Codex 会把逐页 PPT 截图和对应转录稿拆成互不重叠的批次，交给多个 sub-agent 并行生成 `codex_notes/slide_N.md`，再由本地脚本汇总。最终稿严格保持一页 PPT 对应一段完整讲稿。
 
-### 4.2 火山引擎 ASR
+### 4.2 转录后端
 
-配置项：
+默认 `--provider auto`：
+
+- 配置有效 `VOLCENGINE_API_KEY`：使用火山引擎 ASR Flash；
+- 未配置 Key：使用本地 OpenAI Whisper；
+- 也可用 `--provider volcengine|whisper` 显式指定。
+
+本地 Whisper 默认模型为 `small`，可通过 `--whisper-model tiny|base|small|medium|large-v3` 调整，并可用 `--whisper-device auto|cpu|cuda` 指定设备。
+
+火山引擎配置项：
 
 ```python
 VOLCENGINE_API_KEY = "YOUR_VOLCENGINE_API_KEY"
@@ -184,9 +205,9 @@ DEFAULT_LANGUAGE = "zh-CN"
 
 ---
 
-## 5. API 怎么申请
+## 5. 可选的云端 API
 
-### 5.1 申请火山引擎语音识别
+### 5.1 申请火山引擎语音识别（可选）
 
 步骤：
 
@@ -212,6 +233,7 @@ RESOURCE_ID = "volc.bigasr.auc_turbo"
 - 新版控制台只需要 `VOLCENGINE_API_KEY`。
 - 旧版控制台需要同时配置 `APP_KEY` 与 `ACCESS_KEY`。
 - 音频不经过第三方存储；Base64 内容只发送到火山引擎识别接口。
+- 不配置火山 Key 时无需申请 API，安装 `requirements-whisper.txt` 后会自动在本机转录。
 
 ---
 
@@ -222,9 +244,9 @@ RESOURCE_ID = "volc.bigasr.auc_turbo"
 ```text
 video.mp4
   -> 抽取 audio.mp3
-  -> Base64 编码到 audio.data
-  -> 调用火山引擎 recognize/flash API
-  -> 同一次 HTTP 请求返回识别结果
+  -> 自动选择转录后端
+     -> 有有效 Key：Base64 直传火山引擎 recognize/flash API
+     -> 无 Key：本地 Whisper 识别
   -> 写出 <video>_transcript.txt
 ```
 
@@ -397,7 +419,17 @@ runner 会在结束前检查 `<img src="...">` 引用是否都能找到。
 - 未开通 `volc.bigasr.auc_turbo` 资源；
 - 音频超过 2 小时或 100MB；
 - 音频格式不属于 WAV、MP3、OGG OPUS；
-- 服务额度不足或 HTTP 请求超时。
+- 服务额度不足或 HTTP 请求超时；
+- 未配置火山 Key，同时未安装 `scripts/requirements-whisper.txt`；
+- 本地 Whisper 首次下载模型失败，或系统缺少 `ffmpeg`。
+
+强制使用本地 Whisper 排查时可运行：
+
+```bash
+python scripts/01_transcribe_video.py /path/to/video.mp4 \
+  --provider whisper \
+  --whisper-model small
+```
 
 ### 9.3 Codex notes 没有生成或没有生效
 

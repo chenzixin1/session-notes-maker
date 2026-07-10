@@ -79,6 +79,62 @@ class DirectUploadTests(unittest.TestCase):
                     transcriber.recognize_audio(audio.name)
             post.assert_not_called()
 
+    def test_auto_provider_prefers_volcengine_when_key_exists(self):
+        with patch.object(self.module, "local_whisper_available", return_value=True):
+            provider = self.module.select_transcription_provider("auto", "configured-key")
+        self.assertEqual(provider, "volcengine")
+
+    def test_auto_provider_falls_back_to_local_whisper_without_key(self):
+        with patch.object(self.module, "local_whisper_available", return_value=True):
+            provider = self.module.select_transcription_provider("auto", None)
+        self.assertEqual(provider, "whisper")
+
+    def test_missing_key_and_whisper_returns_actionable_error(self):
+        with patch.object(self.module, "local_whisper_available", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "openai-whisper"):
+                self.module.select_transcription_provider("auto", None)
+
+    def test_local_whisper_result_matches_existing_transcript_schema(self):
+        class FakeModel:
+            def transcribe(self, audio_path, **kwargs):
+                self.audio_path = audio_path
+                self.kwargs = kwargs
+                return {
+                    "text": "你好，世界。",
+                    "segments": [
+                        {"start": 0.25, "end": 1.5, "text": "你好，"},
+                        {"start": 1.5, "end": 2.75, "text": "世界。"},
+                    ],
+                }
+
+        class FakeWhisper:
+            def __init__(self):
+                self.model = FakeModel()
+
+            def load_model(self, model_name, **kwargs):
+                self.model_name = model_name
+                self.load_kwargs = kwargs
+                return self.model
+
+        fake_whisper = FakeWhisper()
+        transcriber = self.module.LocalWhisperTranscriber(
+            model_name="small",
+            language="zh-CN",
+            whisper_module=fake_whisper,
+        )
+        result = transcriber.recognize_audio("audio.mp3", show_utterances=True)
+
+        self.assertEqual(result["result"]["text"], "你好，世界。")
+        self.assertEqual(
+            result["result"]["utterances"],
+            [
+                {"start_time": 250, "end_time": 1500, "text": "你好，"},
+                {"start_time": 1500, "end_time": 2750, "text": "世界。"},
+            ],
+        )
+        self.assertEqual(fake_whisper.model_name, "small")
+        self.assertEqual(fake_whisper.model.kwargs["language"], "zh")
+
 
 if __name__ == "__main__":
     unittest.main()

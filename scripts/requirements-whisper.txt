@@ -1,0 +1,2 @@
+# Optional no-key transcription fallback. Installs OpenAI Whisper and its local runtime.
+openai-whisper>=20240930

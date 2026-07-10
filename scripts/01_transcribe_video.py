@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Extract audio from local media and transcribe it with Volcengine ASR Flash."""
+"""Extract audio and transcribe with Volcengine ASR or local Whisper."""
 
 from __future__ import annotations
 
 import argparse
 import base64
+import importlib
+import importlib.util
 import json
 import os
 import shutil
@@ -74,6 +76,43 @@ def _normalize_language(language):
         "ko": "ko-KR",
     }
     return aliases.get(language, language)
+
+
+def _normalize_whisper_language(language):
+    """Convert locale-style language codes to Whisper's short codes."""
+    if not language:
+        return None
+    return str(language).split("-", 1)[0].lower()
+
+
+def local_whisper_available():
+    """Return whether the optional OpenAI Whisper package is installed."""
+    return importlib.util.find_spec("whisper") is not None
+
+
+def select_transcription_provider(requested, api_key):
+    """Resolve auto/explicit provider selection without making a network call."""
+    if requested == "volcengine":
+        if not api_key:
+            raise RuntimeError("Volcengine provider requires VOLCENGINE_API_KEY or --api-key")
+        return "volcengine"
+    if requested == "whisper":
+        if not local_whisper_available():
+            raise RuntimeError(
+                "Local openai-whisper is not installed; "
+                "run `pip install -r scripts/requirements-whisper.txt`"
+            )
+        return "whisper"
+    if requested != "auto":
+        raise ValueError(f"Unknown transcription provider: {requested}")
+    if api_key:
+        return "volcengine"
+    if local_whisper_available():
+        return "whisper"
+    raise RuntimeError(
+        "Volcengine key is missing and local openai-whisper is not installed; "
+        "run `pip install -r scripts/requirements-whisper.txt`"
+    )
 
 
 def _audio_format(audio_path):
@@ -332,9 +371,61 @@ class AudioTranscriber:
         return result
 
 
+class LocalWhisperTranscriber(AudioTranscriber):
+    """Run OpenAI Whisper locally and return the existing transcript schema."""
+
+    def __init__(
+        self,
+        model_name="small",
+        language="zh-CN",
+        device="auto",
+        whisper_module=None,
+    ):
+        super().__init__(api_key="")
+        self.model_name = model_name
+        self.language = language
+        self.device = device
+        self.whisper_module = whisper_module
+
+    def recognize_audio(self, audio_path, lang=None, punctuation=True, show_utterances=True):
+        del punctuation  # Whisper handles punctuation as part of decoding.
+        whisper_module = self.whisper_module or importlib.import_module("whisper")
+        load_kwargs = {}
+        if self.device and self.device != "auto":
+            load_kwargs["device"] = self.device
+        print(f"Loading local Whisper model: {self.model_name}")
+        model = whisper_module.load_model(self.model_name, **load_kwargs)
+        language = _normalize_whisper_language(lang or self.language)
+        print(f"Running local Whisper transcription ({language or 'auto language'})")
+        raw = model.transcribe(
+            str(audio_path),
+            language=language,
+            verbose=False,
+            fp16=False,
+            temperature=0,
+        )
+        utterances = []
+        if show_utterances:
+            for segment in raw.get("segments", []):
+                text = (segment.get("text") or "").strip()
+                if not text:
+                    continue
+                utterances.append(
+                    {
+                        "start_time": round(float(segment.get("start", 0)) * 1000),
+                        "end_time": round(float(segment.get("end", 0)) * 1000),
+                        "text": text,
+                    }
+                )
+        full_text = (raw.get("text") or "").strip()
+        if not full_text:
+            full_text = "".join(item["text"] for item in utterances)
+        return {"result": {"text": full_text, "utterances": utterances}}
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Transcribe local audio/video with Volcengine ASR Flash direct upload."
+        description="Transcribe local audio/video with Volcengine ASR or local Whisper fallback."
     )
     parser.add_argument("input_file", help="Path to a local audio or video file")
     parser.add_argument("--output", "-o", help="Transcript text output path")
@@ -342,6 +433,22 @@ def main():
     parser.add_argument("--api-key", help="New-console Volcengine API key")
     parser.add_argument("--access-key", help="API key, or old-console access token")
     parser.add_argument("--app-key", help="Old-console App ID/App Key")
+    parser.add_argument(
+        "--provider",
+        choices=["auto", "volcengine", "whisper"],
+        default="auto",
+        help="auto prefers Volcengine when a key exists, otherwise local Whisper",
+    )
+    parser.add_argument(
+        "--whisper-model",
+        default=getattr(config, "WHISPER_MODEL", "small"),
+        help="Local Whisper model name (default: config WHISPER_MODEL or small)",
+    )
+    parser.add_argument(
+        "--whisper-device",
+        default="auto",
+        help="Whisper device such as auto, cpu, or cuda",
+    )
     parser.add_argument(
         "--lang",
         default=getattr(config, "DEFAULT_LANGUAGE", "zh-CN"),
@@ -354,13 +461,21 @@ def main():
 
     app_key = args.app_key or _configured_value("APP_KEY")
     api_key = args.api_key or args.access_key or _configured_value("VOLCENGINE_API_KEY", "ACCESS_KEY")
-    if not api_key:
-        parser.error(
-            "Volcengine API key is missing; set VOLCENGINE_API_KEY/ACCESS_KEY in config.py "
-            "or pass --api-key"
-        )
+    try:
+        provider = select_transcription_provider(args.provider, api_key)
+    except (RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
 
-    transcriber = AudioTranscriber(api_key=api_key, app_key=app_key, timeout=args.timeout)
+    if provider == "volcengine":
+        transcriber = AudioTranscriber(api_key=api_key, app_key=app_key, timeout=args.timeout)
+        print("Transcription provider: Volcengine ASR Flash")
+    else:
+        transcriber = LocalWhisperTranscriber(
+            model_name=args.whisper_model,
+            language=args.lang,
+            device=args.whisper_device,
+        )
+        print("Transcription provider: local Whisper")
     try:
         audio_path = transcriber.process_input_file(args.input_file)
         result = transcriber.recognize_audio(
